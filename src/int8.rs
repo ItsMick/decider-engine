@@ -42,7 +42,7 @@ fn scalar_dot(a: &[i8], b: &[u8]) -> i32 {
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 #[target_feature(enable = "dotprod")]
 unsafe fn arm_dot(a: &[i8], b: &[u8]) -> i32 {
-    use std::arch::aarch64::{vaddvq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
     let (a_chunks, a_tail) = a.as_chunks::<16>();
     let (b_chunks, b_tail) = b.as_chunks::<16>();
     let mut acc = vdupq_n_s32(0);
@@ -50,19 +50,7 @@ unsafe fn arm_dot(a: &[i8], b: &[u8]) -> i32 {
         // SAFETY: each array contains exactly 16 initialized bytes. The loads
         // permit unaligned pointers and only read within these immutable arrays.
         let (a, b) = unsafe { (vld1q_s8(a.as_ptr()), vld1q_s8(b.as_ptr().cast::<i8>())) };
-        // Rust 1.88 does not expose a stable SDOT intrinsic. This register-only
-        // instruction keeps the minimum compiler version without nightly Rust.
-        // SAFETY: dotprod is enabled by the caller; all operands are initialized
-        // vector registers. SDOT has no memory, stack, or condition flag effects.
-        unsafe {
-            std::arch::asm!(
-                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-                acc = inout(vreg) acc,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(pure, nomem, nostack, preserves_flags),
-            );
-        }
+        acc = vdotq_s32(acc, a, b);
     }
     vaddvq_s32(acc) + scalar_dot(a_tail, b_tail)
 }

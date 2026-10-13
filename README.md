@@ -13,7 +13,7 @@ and licenses.
 
 ## Run
 
-Requires Rust 1.88+ and a C compiler for the tokenizer dependency.
+Requires Rust 1.98+ and a C compiler for the tokenizer dependency.
 The optional download helper needs Python 3.11+ and `curl`.
 
 ```sh
@@ -69,7 +69,7 @@ println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 For a Git dependency:
 
 ```toml
-decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.1.3" }
+decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.0" }
 ```
 
 ## Scope and checks
@@ -130,10 +130,10 @@ and refit calibration for your workload before relying on confidence thresholds.
 Weight compression primarily saves memory. Integer computation requires
 benchmarking on the deployment CPU; no Lambda speedup is established.
 
-The checked ARM kernel in `src/int8.rs` uses bounded 16-byte loads and a
-register-only `SDOT` instruction. Inline assembly preserves Rust 1.88 support;
-the compiler's SDOT intrinsic was not stable at that version. Each dot product
-is limited to 64 bytes, preventing INT32 overflow even for -128 inputs. ARM CI
+The checked ARM kernel in `src/int8.rs` uses bounded 16-byte loads and the stable
+[`vdotq_s32`](https://doc.rust-lang.org/core/arch/aarch64/fn.vdotq_s32.html)
+intrinsic, which requires Rust 1.98. There is no handwritten assembly. Each dot
+product is limited to 64 bytes, preventing INT32 overflow even for -128 inputs. ARM CI
 requires dot-product support and compares the accelerated and scalar results.
 
 See [ARM64 Lambda notes](docs/lambda.md) for build targets, sizing, and limitations.

@@ -11,11 +11,11 @@ jobs:
           - os: ubuntu-latest
             rust: stable
           - os: ubuntu-latest
-            rust: '1.88'
+            rust: '1.98'
           - os: macos-latest
             rust: stable
           - os: ubuntu-24.04-arm
-            rust: stable
+            rust: '1.98'
             rustflags: '-C target-cpu=neoverse-n1'
     runs-on: ${{ matrix.os }}
     env:

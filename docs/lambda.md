@@ -9,7 +9,8 @@ host uses Tokio; do not block its async worker with a forward pass.
 
 ## Build and package
 
-AWS documents ARM64 Lambda as Graviton2 / Neoverse N1. For a Linux ARM64 build,
+AWS documents ARM64 Lambda as Graviton2 / Neoverse N1. Use Rust 1.98 or newer,
+which provides the stable `vdotq_s32` intrinsic. For a Linux ARM64 build,
 use `aarch64-unknown-linux-gnu` in an Amazon Linux 2023 build environment, or
 `aarch64-unknown-linux-musl` for a static binary. The tokenizer needs a C compiler
 for that same target. Host glibc builds from a newer distribution may be
@@ -98,7 +99,9 @@ treated as equivalent to those methods or as an AWS-endorsed preset.
 [CI run 38388086320](https://github.com/ItsMick/decider-engine/actions/runs/38388086320)
 executed the accelerated kernel on a Linux ARM64 runner with `SDOT` detected,
 four Rayon workers and `-C target-cpu=neoverse-n1`. A warmed synthetic
-2048-by-2048 projection averaged three timed runs per mode:
+2048-by-2048 projection averaged three timed runs per mode. These historical
+v0.1.2 measurements used inline `SDOT` assembly; v0.2.0 replaces it with the
+stable Rust intrinsic and CI reruns the same benchmark:
 
 | Input tokens | INT8 weights, FP32 compute (ms) | INT8 compute (ms) |
 | ---: | ---: | ---: |
