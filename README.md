@@ -69,7 +69,7 @@ println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 For a Git dependency:
 
 ```toml
-decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.1" }
+decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.2" }
 ```
 
 ## Scope and checks
@@ -99,6 +99,11 @@ shares rotary sine/cosine values across heads and layers within each request,
 and reuses normalization and attention-score buffers. Large causal attention
 passes parallelize independent token rows; short passes remain sequential.
 These changes preserve reduction order and do not change quantization settings.
+Base projections and LoRA B readout share output storage. SwiGLU and down-projection
+residual addition run during the final output write, avoiding full-size up,
+down and adapter-delta tensors. Post-attention residual addition, copying and
+RMS statistics share a pass. Low-rank intermediates and projection column buffers
+remain; the floating-point arithmetic order is preserved.
 
 ## Lower precision and ARM64 Lambda
 

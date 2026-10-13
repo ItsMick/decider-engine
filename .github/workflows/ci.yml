@@ -40,3 +40,8 @@ jobs:
       - name: Measure synthetic ARM attention
         if: matrix.os == 'ubuntu-24.04-arm'
         run: cargo test --release --locked --lib benchmark_causal_attention -- --ignored --nocapture
+      - name: Measure synthetic ARM fusion
+        if: matrix.os == 'ubuntu-24.04-arm'
+        env:
+          RAYON_NUM_THREADS: '4'
+        run: cargo test --release --locked --lib benchmark_fused_projection -- --ignored --nocapture

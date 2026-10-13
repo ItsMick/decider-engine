@@ -24,7 +24,117 @@ pub(crate) fn dot_scores(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// Weight rows are reused across tokens; transpose the temporary output once.
+/// Operations applied while transposing completed projection values.
+#[derive(Clone, Copy)]
+pub(crate) enum Epilogue {
+    Write,
+    Add,
+    SwiGlu,
+}
+impl Epilogue {
+    fn store(self, dst: &mut f32, value: f32) {
+        match self {
+            Self::Write => *dst = value,
+            Self::Add => *dst += value,
+            Self::SwiGlu => *dst = crate::qwen::silu(*dst) * value,
+        }
+    }
+}
+
+pub(crate) struct Adapter<'a> {
+    pub inputs: &'a [f32],
+    pub weights: &'a Data,
+    pub rank: usize,
+    pub scale: f32,
+}
+impl Adapter<'_> {
+    fn combine(&self, base: f32, row: usize, weights: &[f32]) -> f32 {
+        // Preserve the standalone B projection's bias-zero addition and the
+        // original FP32 multiply/add order; do not use a fused multiply-add.
+        let delta = dot_scores(
+            &self.inputs[row * self.rank..(row + 1) * self.rank],
+            weights,
+        ) + 0.0;
+        base + self.scale * delta
+    }
+}
+
+pub(crate) struct Projection<'a> {
+    pub input: usize,
+    pub output: usize,
+    pub weights: &'a Data,
+    pub bias: Option<&'a [f32]>,
+    pub adapter: Option<Adapter<'a>>,
+}
+impl Projection<'_> {
+    /// Base and LoRA outputs share column storage. Final writes may add a
+    /// residual or consume an existing gate, avoiding full-sized intermediates.
+    pub(crate) fn apply(&self, x: &[f32], result: &mut [f32], epilogue: Epilogue) {
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
+        assert_eq!(x.len(), rows * input);
+        assert_eq!(self.weights.len(), output * input);
+        assert_eq!(result.len(), rows * output);
+        assert!(self.bias.is_none_or(|b| b.len() == output));
+        if let Some(adapter) = &self.adapter {
+            assert_eq!(adapter.inputs.len(), rows * adapter.rank);
+            assert_eq!(adapter.weights.len(), output * adapter.rank);
+        }
+        if rows == 0 {
+            return;
+        }
+        if let Data::Quantized {
+            bits: 8,
+            compute_int8: true,
+            ..
+        } = self.weights
+        {
+            if linear_int8(x, self, result, epilogue) {
+                return;
+            }
+        }
+        let compute = |column: usize, dst: &mut [f32], scratch: &mut (Vec<f32>, Vec<f32>)| {
+            let w = self.weights.row(column * input, input, &mut scratch.0);
+            let adapter = self
+                .adapter
+                .as_ref()
+                .map(|a| (a, a.weights.row(column * a.rank, a.rank, &mut scratch.1)));
+            let b = self.bias.map_or(0.0, |b| b[column]);
+            for (row, (value, token)) in dst.iter_mut().zip(x.chunks_exact(input)).enumerate() {
+                let base = dot_scores(token, w) + b;
+                *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+            }
+        };
+        let mut columns = vec![0.0; result.len()];
+        if rows * output >= 512 {
+            columns.par_chunks_mut(rows).enumerate().for_each_init(
+                || (Vec::new(), Vec::new()),
+                |scratch, (column, dst)| compute(column, dst, scratch),
+            );
+        } else {
+            let mut scratch = (Vec::new(), Vec::new());
+            for (column, dst) in columns.chunks_mut(rows).enumerate() {
+                compute(column, dst, &mut scratch);
+            }
+        }
+        write_columns(&columns, rows, output, result, epilogue);
+    }
+}
+
+fn write_columns(
+    columns: &[f32],
+    rows: usize,
+    output: usize,
+    result: &mut [f32],
+    epilogue: Epilogue,
+) {
+    for (row, dst) in result.chunks_exact_mut(output).enumerate() {
+        for (column, value) in dst.iter_mut().enumerate() {
+            epilogue.store(value, columns[column * rows + row]);
+        }
+    }
+}
+
 pub(crate) fn linear(
     x: &[f32],
     rows: usize,
@@ -35,48 +145,14 @@ pub(crate) fn linear(
     result: &mut [f32],
 ) {
     assert_eq!(x.len(), rows * input);
-    assert_eq!(weights.len(), output * input);
-    assert_eq!(result.len(), rows * output);
-    assert!(bias.is_none_or(|b| b.len() == output));
-    if rows == 0 {
-        return;
+    Projection {
+        input,
+        output,
+        weights,
+        bias,
+        adapter: None,
     }
-    if let Data::Quantized {
-        bits: 8,
-        compute_int8: true,
-        ..
-    } = weights
-    {
-        if linear_int8(x, rows, input, weights, output, bias, result) {
-            return;
-        }
-    }
-    let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
-        let w = weights.row(column * input, input, scratch);
-        let b = bias.map_or(0.0, |b| b[column]);
-        for (value, token) in dst.iter_mut().zip(x.chunks_exact(input)) {
-            *value = dot_scores(token, w) + b;
-        }
-    };
-    let mut columns = vec![0.0; result.len()];
-    if rows * output >= 512 {
-        columns
-            .par_chunks_mut(rows)
-            .enumerate()
-            .for_each_init(Vec::new, |scratch, (column, dst)| {
-                compute(column, dst, scratch)
-            });
-    } else {
-        let mut scratch = Vec::new();
-        for (column, dst) in columns.chunks_mut(rows).enumerate() {
-            compute(column, dst, &mut scratch);
-        }
-    }
-    for (row, dst) in result.chunks_exact_mut(output).enumerate() {
-        for (column, value) in dst.iter_mut().enumerate() {
-            *value = columns[column * rows + row];
-        }
-    }
+    .apply(x, result, Epilogue::Write);
 }
 
 struct QuantizedInputs {
@@ -116,20 +192,19 @@ impl QuantizedInputs {
 
 fn linear_int8(
     x: &[f32],
-    rows: usize,
-    input: usize,
-    weights: &Data,
-    output: usize,
-    bias: Option<&[f32]>,
+    projection: &Projection<'_>,
     result: &mut [f32],
+    epilogue: Epilogue,
 ) -> bool {
+    let (input, output) = (projection.input, projection.output);
+    let rows = x.len() / input;
     let Data::Quantized {
         values,
         scales,
         width,
         bits: 8,
         ..
-    } = weights
+    } = projection.weights
     else {
         unreachable!("integer projection requires INT8 weights");
     };
@@ -139,9 +214,13 @@ fn linear_int8(
     };
     let groups = input.div_ceil(64);
     let kernel = Kernel::detect();
-    let compute = |column: usize, dst: &mut [f32]| {
+    let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
         let w = &values[column * input..(column + 1) * input];
         let w_scales = &scales[column * groups..(column + 1) * groups];
+        let adapter = projection
+            .adapter
+            .as_ref()
+            .map(|a| (a, a.weights.row(column * a.rank, a.rank, scratch)));
         for (row, (value, token)) in dst
             .iter_mut()
             .zip(inputs.values.chunks_exact(input))
@@ -157,7 +236,8 @@ fn linear_int8(
             {
                 sum += kernel.dot(a, b) as f32 * (*xs * *ws);
             }
-            *value = sum + bias.map_or(0.0, |b| b[column]);
+            let base = sum + projection.bias.map_or(0.0, |b| b[column]);
+            *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
         }
     };
     let mut columns = vec![0.0; result.len()];
@@ -165,17 +245,16 @@ fn linear_int8(
         columns
             .par_chunks_mut(rows)
             .enumerate()
-            .for_each(|(column, dst)| compute(column, dst));
+            .for_each_init(Vec::new, |scratch, (column, dst)| {
+                compute(column, dst, scratch)
+            });
     } else {
+        let mut scratch = Vec::new();
         for (column, dst) in columns.chunks_mut(rows).enumerate() {
-            compute(column, dst);
+            compute(column, dst, &mut scratch);
         }
     }
-    for (row, dst) in result.chunks_exact_mut(output).enumerate() {
-        for (column, value) in dst.iter_mut().enumerate() {
-            *value = columns[column * rows + row];
-        }
-    }
+    write_columns(&columns, rows, output, result, epilogue);
     true
 }
 

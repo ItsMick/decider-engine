@@ -1,5 +1,5 @@
 //! Validated F32/BF16/F16 safetensors; no pickle or model code execution.
-use crate::tensor::linear;
+use crate::tensor::{linear, Adapter, Epilogue, Projection};
 use crate::Precision;
 use safetensors::{tensor::Metadata, Dtype};
 use std::{
@@ -416,31 +416,163 @@ impl Linear {
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
         let rows = x.len() / self.input;
         let mut out = vec![0.0; rows * self.output];
-        linear(
-            x,
-            rows,
-            self.input,
-            &self.w,
-            self.output,
-            self.bias.as_deref(),
-            &mut out,
-        );
-        if let Some((a, b, rank, scale)) = &self.lora {
-            let mut mid = vec![0.0; rows * rank];
-            linear(x, rows, self.input, a, *rank, None, &mut mid);
-            let mut delta = vec![0.0; out.len()];
-            linear(&mid, rows, *rank, b, self.output, None, &mut delta);
-            for (o, d) in out.iter_mut().zip(delta) {
-                *o += scale * d;
-            }
-        }
+        self.apply_into(x, &mut out, Epilogue::Write);
         out
+    }
+    pub fn apply_into(&self, x: &[f32], out: &mut [f32], epilogue: Epilogue) {
+        let rows = x.len() / self.input;
+        let mut mid = Vec::new();
+        let adapter = if let Some((a, b, rank, scale)) = &self.lora {
+            mid.resize(rows * rank, 0.0);
+            linear(x, rows, self.input, a, *rank, None, &mut mid);
+            Some(Adapter {
+                inputs: &mid,
+                weights: b,
+                rank: *rank,
+                scale: *scale,
+            })
+        } else {
+            None
+        };
+        Projection {
+            input: self.input,
+            output: self.output,
+            weights: &self.w,
+            bias: self.bias.as_deref(),
+            adapter,
+        }
+        .apply(x, out, epilogue);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "synthetic fusion timing; run with --release and fixed RAYON_NUM_THREADS"]
+    fn benchmark_fused_projection() {
+        use std::{hint::black_box, time::Instant};
+        let (input, output, rank) = (2048usize, 6144usize, 16usize);
+        let packed = |len| {
+            Data::Bf16(
+                (0..len)
+                    .map(|i| ((((i * 17 % 89) as f32 - 44.0) / 64.0).to_bits() >> 16) as u16)
+                    .collect(),
+            )
+        };
+        for precision in [Precision::Checkpoint, Precision::Int8Compute] {
+            let layer = Linear {
+                w: packed(input * output).quantize(input, precision),
+                bias: None,
+                input,
+                output,
+                lora: Some((packed(rank * input), packed(output * rank), rank, 0.5)),
+            };
+            for rows in [32, 128] {
+                let x: Vec<f32> = (0..rows * input)
+                    .map(|i| ((i * 43 % 113) as f32 - 56.0) / 127.0)
+                    .collect();
+                let mut gate = vec![0.0; rows * output];
+                for fused in [false, true] {
+                    let run = |gate: &mut [f32]| {
+                        gate.fill(0.75);
+                        if fused {
+                            layer.apply_into(black_box(&x), gate, Epilogue::SwiGlu);
+                        } else {
+                            let up = unfused_apply(&layer, black_box(&x));
+                            for (gate, up) in gate.iter_mut().zip(up) {
+                                *gate = crate::qwen::silu(*gate) * up;
+                            }
+                        }
+                        black_box(gate);
+                    };
+                    run(&mut gate);
+                    let start = Instant::now();
+                    for _ in 0..3 {
+                        run(&mut gate);
+                    }
+                    println!("fusion precision={precision:?} rows={rows} fused={fused} workers={} mean_ms={:.3}",
+                        rayon::current_num_threads(), start.elapsed().as_secs_f64() * 1000.0 / 3.0);
+                }
+            }
+        }
+    }
+
+    fn unfused_apply(layer: &Linear, x: &[f32]) -> Vec<f32> {
+        let rows = x.len() / layer.input;
+        let mut out = vec![0.0; rows * layer.output];
+        linear(
+            x,
+            rows,
+            layer.input,
+            &layer.w,
+            layer.output,
+            layer.bias.as_deref(),
+            &mut out,
+        );
+        if let Some((a, b, rank, scale)) = &layer.lora {
+            let mut mid = vec![0.0; rows * rank];
+            linear(x, rows, layer.input, a, *rank, None, &mut mid);
+            let mut delta = vec![0.0; out.len()];
+            linear(&mid, rows, *rank, b, layer.output, None, &mut delta);
+            for (value, delta) in out.iter_mut().zip(delta) {
+                *value += scale * delta;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fused_lora_and_epilogues_match_separate_projections_in_every_precision() {
+        let (input, output, rank) = (131usize, 31, 13);
+        for rows in [1, 19] {
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| ((i * 43 % 113) as f32 - 56.0) / 32.0)
+                .collect();
+            for precision in [
+                Precision::Checkpoint,
+                Precision::Int8,
+                Precision::Int8Compute,
+                Precision::Int4,
+            ] {
+                let packed = |count: usize| {
+                    Data::Bf16(
+                        (0..count)
+                            .map(|i| {
+                                ((((i * 17 % 89) as f32 - 44.0) / 32.0).to_bits() >> 16) as u16
+                            })
+                            .collect(),
+                    )
+                };
+                let layer = Linear {
+                    w: packed(input * output).quantize(input, precision),
+                    bias: Some((0..output).map(|i| i as f32 / 64.0 - 0.25).collect()),
+                    input,
+                    output,
+                    lora: Some((packed(rank * input), packed(output * rank), rank, 0.375)),
+                };
+                let expected = unfused_apply(&layer, &x);
+                assert_eq!(layer.apply(&x), expected);
+                for epilogue in [Epilogue::Add, Epilogue::SwiGlu] {
+                    let original: Vec<f32> =
+                        (0..expected.len()).map(|i| i as f32 / 16.0 - 3.0).collect();
+                    let separate: Vec<f32> = original
+                        .iter()
+                        .zip(&expected)
+                        .map(|(old, value)| match epilogue {
+                            Epilogue::Add => old + value,
+                            Epilogue::SwiGlu => crate::qwen::silu(*old) * value,
+                            Epilogue::Write => unreachable!(),
+                        })
+                        .collect();
+                    let mut fused = original;
+                    layer.apply_into(&x, &mut fused, epilogue);
+                    assert_eq!(fused, separate);
+                }
+            }
+        }
+    }
     #[test]
     fn half_and_bfloat_readout() {
         assert_eq!(

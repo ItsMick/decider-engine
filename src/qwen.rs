@@ -1,6 +1,6 @@
 //! Text-only Qwen3.5: full causal GQA and recurrent Gated DeltaNet.
 //! FP32 arithmetic matches the upstream CPU serving path. No generation or KV cache.
-use crate::tensor::{dot_scores, softmax};
+use crate::tensor::{dot_scores, softmax, Epilogue};
 use crate::weights::{Data, Linear, Weights};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -117,9 +117,24 @@ pub(crate) fn rms(x: &mut [f32], w: &[f32], eps: f32, centered: bool) {
         }
     }
 }
-fn add(x: &mut [f32], y: &[f32]) {
-    for (a, b) in x.iter_mut().zip(y) {
-        *a += b;
+fn residual_norm(x: &mut [f32], residual: &[f32], normalized: &mut [f32], w: &[f32], eps: f32) {
+    assert_eq!(x.len(), residual.len());
+    assert_eq!(x.len(), normalized.len());
+    for ((x, residual), dst) in x
+        .chunks_exact_mut(w.len())
+        .zip(residual.chunks_exact(w.len()))
+        .zip(normalized.chunks_exact_mut(w.len()))
+    {
+        let mut sum = -0.0;
+        for ((x, residual), dst) in x.iter_mut().zip(residual).zip(dst.iter_mut()) {
+            *x += residual;
+            *dst = *x;
+            sum += *x * *x;
+        }
+        let inv = (sum / w.len() as f32 + eps).sqrt().recip();
+        for (v, g) in dst.iter_mut().zip(w) {
+            *v *= inv * (1.0 + g);
+        }
     }
 }
 fn rotary(x: &mut [f32], angles: &[(f32, f32)]) {
@@ -314,15 +329,10 @@ impl Model {
                 Mixer::Full(m) => m.forward(&n, c, &angles),
                 Mixer::Delta(m) => m.forward(&n, c),
             };
-            add(&mut x, &mixed);
-            n.copy_from_slice(&x);
-            rms(&mut n, &layer.post_norm, c.rms_norm_eps, true);
+            residual_norm(&mut x, &mixed, &mut n, &layer.post_norm, c.rms_norm_eps);
             let mut gate = layer.gate.apply(&n);
-            let up = layer.up.apply(&n);
-            for (g, u) in gate.iter_mut().zip(up) {
-                *g = silu(*g) * u;
-            }
-            add(&mut x, &layer.down.apply(&gate));
+            layer.up.apply_into(&n, &mut gate, Epilogue::SwiGlu);
+            layer.down.apply_into(&gate, &mut x, Epilogue::Add);
         }
         rms(&mut x, &self.norm, c.rms_norm_eps, true);
         if x.iter().any(|v| !v.is_finite()) {
@@ -512,6 +522,27 @@ impl Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_norm_matches_separate_residual_copy_and_normalization() {
+        for width in [1, 8, 131] {
+            let x: Vec<f32> = (0..width * 3)
+                .map(|i| ((i * 23 % 79) as f32 - 39.0) / 17.0)
+                .collect();
+            let residual: Vec<f32> = (0..x.len())
+                .map(|i| ((i * 41 % 113) as f32 - 56.0) / 29.0)
+                .collect();
+            let weights: Vec<f32> = (0..width).map(|i| i as f32 / 19.0 - 0.5).collect();
+            let expected_x: Vec<f32> = x.iter().zip(&residual).map(|(a, b)| a + b).collect();
+            let mut expected_norm = expected_x.clone();
+            rms(&mut expected_norm, &weights, 1e-6, true);
+            let mut fused_x = x;
+            let mut fused_norm = vec![0.0; fused_x.len()];
+            residual_norm(&mut fused_x, &residual, &mut fused_norm, &weights, 1e-6);
+            assert_eq!(fused_x, expected_x);
+            assert_eq!(fused_norm, expected_norm);
+        }
+    }
 
     #[test]
     #[ignore = "synthetic attention timing; run with --release"]
