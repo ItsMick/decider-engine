@@ -473,10 +473,13 @@ mod tests {
                 let x: Vec<f32> = (0..rows * input)
                     .map(|i| ((i * 43 % 113) as f32 - 56.0) / 127.0)
                     .collect();
-                let mut gate = vec![0.0; rows * output];
+                let original_gate: Vec<f32> = (0..rows * output)
+                    .map(|i| ((i * 53 % 127) as f32 - 63.0) / 32.0)
+                    .collect();
+                let mut gate = original_gate.clone();
                 for fused in [false, true] {
                     let run = |gate: &mut [f32]| {
-                        gate.fill(0.75);
+                        gate.copy_from_slice(&original_gate);
                         if fused {
                             layer.apply_into(black_box(&x), gate, Epilogue::SwiGlu);
                         } else {
@@ -526,7 +529,7 @@ mod tests {
     #[test]
     fn fused_lora_and_epilogues_match_separate_projections_in_every_precision() {
         let (input, output, rank) = (131usize, 31, 13);
-        for rows in [1, 19] {
+        for rows in [1, 19, 67] {
             let x: Vec<f32> = (0..rows * input)
                 .map(|i| ((i * 43 % 113) as f32 - 56.0) / 32.0)
                 .collect();

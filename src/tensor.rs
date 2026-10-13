@@ -67,8 +67,8 @@ pub(crate) struct Projection<'a> {
     pub adapter: Option<Adapter<'a>>,
 }
 impl Projection<'_> {
-    /// Base and LoRA outputs share column storage. Final writes may add a
-    /// residual or consume an existing gate, avoiding full-sized intermediates.
+    /// Base and LoRA share the final write, which may add a residual or
+    /// consume an existing gate. Larger batches retain separate dot passes.
     pub(crate) fn apply(&self, x: &[f32], result: &mut [f32], epilogue: Epilogue) {
         let (input, output) = (self.input, self.output);
         let rows = x.len() / input;
@@ -83,14 +83,48 @@ impl Projection<'_> {
         if rows == 0 {
             return;
         }
+        if let Some(adapter) = self.adapter.as_ref().filter(|_| rows >= 64) {
+            let base = Projection {
+                input,
+                output,
+                weights: self.weights,
+                bias: self.bias,
+                adapter: None,
+            }
+            .columns(x);
+            let delta = Projection {
+                input: adapter.rank,
+                output,
+                weights: adapter.weights,
+                bias: None,
+                adapter: None,
+            }
+            .columns(adapter.inputs);
+            write_columns(
+                &base,
+                Some((&delta, adapter.scale)),
+                rows,
+                output,
+                result,
+                epilogue,
+            );
+        } else {
+            let columns = self.columns(x);
+            write_columns(&columns, None, rows, output, result, epilogue);
+        }
+    }
+
+    fn columns(&self, x: &[f32]) -> Vec<f32> {
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
         if let Data::Quantized {
             bits: 8,
             compute_int8: true,
             ..
         } = self.weights
         {
-            if linear_int8(x, self, result, epilogue) {
-                return;
+            if let Some(columns) = linear_int8(x, self) {
+                return columns;
             }
         }
         let compute = |column: usize, dst: &mut [f32], scratch: &mut (Vec<f32>, Vec<f32>)| {
@@ -105,7 +139,7 @@ impl Projection<'_> {
                 *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
             }
         };
-        let mut columns = vec![0.0; result.len()];
+        let mut columns = vec![0.0; rows * output];
         if rows * output >= 512 {
             columns.par_chunks_mut(rows).enumerate().for_each_init(
                 || (Vec::new(), Vec::new()),
@@ -117,12 +151,13 @@ impl Projection<'_> {
                 compute(column, dst, &mut scratch);
             }
         }
-        write_columns(&columns, rows, output, result, epilogue);
+        columns
     }
 }
 
 fn write_columns(
     columns: &[f32],
+    adapter: Option<(&[f32], f32)>,
     rows: usize,
     output: usize,
     result: &mut [f32],
@@ -130,7 +165,10 @@ fn write_columns(
 ) {
     for (row, dst) in result.chunks_exact_mut(output).enumerate() {
         for (column, value) in dst.iter_mut().enumerate() {
-            epilogue.store(value, columns[column * rows + row]);
+            let index = column * rows + row;
+            let base = columns[index];
+            let projected = adapter.map_or(base, |(delta, scale)| base + scale * delta[index]);
+            epilogue.store(value, projected);
         }
     }
 }
@@ -190,12 +228,7 @@ impl QuantizedInputs {
     }
 }
 
-fn linear_int8(
-    x: &[f32],
-    projection: &Projection<'_>,
-    result: &mut [f32],
-    epilogue: Epilogue,
-) -> bool {
+fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
     let (input, output) = (projection.input, projection.output);
     let rows = x.len() / input;
     let Data::Quantized {
@@ -209,9 +242,7 @@ fn linear_int8(
         unreachable!("integer projection requires INT8 weights");
     };
     assert_eq!(*width, input);
-    let Some(inputs) = QuantizedInputs::new(x, input) else {
-        return false;
-    };
+    let inputs = QuantizedInputs::new(x, input)?;
     let groups = input.div_ceil(64);
     let kernel = Kernel::detect();
     let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
@@ -240,7 +271,7 @@ fn linear_int8(
             *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
         }
     };
-    let mut columns = vec![0.0; result.len()];
+    let mut columns = vec![0.0; rows * output];
     if rows * output >= 512 {
         columns
             .par_chunks_mut(rows)
@@ -254,8 +285,7 @@ fn linear_int8(
             compute(column, dst, &mut scratch);
         }
     }
-    write_columns(&columns, rows, output, result, epilogue);
-    true
+    Some(columns)
 }
 
 pub(crate) fn softmax(values: &mut [f32]) {

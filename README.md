@@ -99,11 +99,12 @@ shares rotary sine/cosine values across heads and layers within each request,
 and reuses normalization and attention-score buffers. Large causal attention
 passes parallelize independent token rows; short passes remain sequential.
 These changes preserve reduction order and do not change quantization settings.
-Base projections and LoRA B readout share output storage. SwiGLU and down-projection
+Base projections and LoRA B readout combine during final output writes. SwiGLU and down-projection
 residual addition run during the final output write, avoiding full-size up,
-down and adapter-delta tensors. Post-attention residual addition, copying and
+down and separate row-major adapter-delta tensors. Post-attention residual addition, copying and
 RMS statistics share a pass. Low-rank intermediates and projection column buffers
-remain; the floating-point arithmetic order is preserved.
+remain. Batches of at least 64 tokens keep base and adapter dot passes separate;
+smaller batches interleave them. The floating-point arithmetic order is preserved.
 
 ## Lower precision and ARM64 Lambda
 
