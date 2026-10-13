@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
-use decider_engine::{DecisionEngine, NativeEngine, Request};
+use decider_engine::{DecisionEngine, NativeEngine, Precision, Request};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 const LIMIT: usize = 2 * 1024 * 1024;
-const HELP: &str = "Usage: decider-engine MODEL_DIR [REQUEST_JSON]\n\nWith a file, evaluate one JSON request. Otherwise read JSONL from stdin,\nkeeping the model resident, and write one JSON response per line.\nMaximum request size: 2 MiB. No network access during inference.\n";
+const HELP: &str = "Usage: decider-engine [--precision checkpoint|int8|int4] MODEL_DIR [REQUEST_JSON]\n\nWith a file, evaluate one JSON request. Otherwise read JSONL from stdin,\nkeeping the model resident, and write one JSON response per line.\nINT8/INT4 are experimental weight-only modes; confidence needs evaluation.\nMaximum request size: 2 MiB. No network access during inference.\n";
 
 fn answer(engine: &NativeEngine, bytes: &[u8], out: &mut impl Write) -> Result<(), String> {
     if bytes.len() > LIMIT {
@@ -18,15 +18,30 @@ fn answer(engine: &NativeEngine, bytes: &[u8], out: &mut impl Write) -> Result<(
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         print!("{HELP}");
         return Ok(());
     }
+    let precision = if args.first().is_some_and(|a| a == "--precision") {
+        if args.len() < 3 {
+            return Err(HELP.into());
+        }
+        let precision = match args[1].to_str() {
+            Some("checkpoint") => Precision::Checkpoint,
+            Some("int8") => Precision::Int8,
+            Some("int4") => Precision::Int4,
+            _ => return Err("precision must be checkpoint, int8, or int4".into()),
+        };
+        args.drain(..2);
+        precision
+    } else {
+        Precision::Checkpoint
+    };
     if !(1..=2).contains(&args.len()) {
         return Err(HELP.into());
     }
-    let engine = NativeEngine::load(Path::new(&args[0]))?;
+    let engine = NativeEngine::load_with_precision(Path::new(&args[0]), precision)?;
     let mut out = io::stdout().lock();
     if args.len() == 2 {
         let file = std::fs::File::open(&args[1]).map_err(|e| e.to_string())?;

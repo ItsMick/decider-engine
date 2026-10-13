@@ -19,6 +19,23 @@ use std::{collections::BTreeMap, path::Path};
 use weights::{Linear, Weights};
 
 pub const ENGINE_ID: &str = "strands-decider-2b-native";
+/// Lower precision modes quantize base linear weights only and need quality evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precision {
+    #[default]
+    Checkpoint,
+    Int8,
+    Int4,
+}
+impl Precision {
+    fn engine_id(self) -> &'static str {
+        match self {
+            Self::Checkpoint => ENGINE_ID,
+            Self::Int8 => "strands-decider-2b-native-int8",
+            Self::Int4 => "strands-decider-2b-native-int4",
+        }
+    }
+}
 pub trait DecisionEngine {
     fn model(&self) -> &str;
     fn decide(&self, request: &Request) -> Result<Response, String>;
@@ -91,6 +108,7 @@ pub struct NativeEngine {
     tokenizer: tokenizers::Tokenizer,
     head: Head,
     config: DeciderConfig,
+    precision: Precision,
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Encoding {
@@ -106,6 +124,10 @@ fn json(path: &Path) -> Result<Value, String> {
 impl NativeEngine {
     /// `dir` holds a Strands export and a `base/` directory with Qwen weights.
     pub fn load(dir: &Path) -> Result<Self, String> {
+        Self::load_with_precision(dir, Precision::Checkpoint)
+    }
+    /// INT8/INT4 are weight-only, groupwise symmetric modes, not GGUF/AWQ formats.
+    pub fn load_with_precision(dir: &Path, precision: Precision) -> Result<Self, String> {
         let config_path = if dir.join("strands_decider_config.json").exists() {
             dir.join("strands_decider_config.json")
         } else {
@@ -180,7 +202,7 @@ impl NativeEngine {
             config.pointer_dim,
         )?;
         let model = qwen::Model::load(
-            Weights::base(&dir.join("base"))?,
+            Weights::base(&dir.join("base"), precision)?,
             &mut adapter,
             cfg,
             rank,
@@ -191,6 +213,7 @@ impl NativeEngine {
             tokenizer,
             head,
             config,
+            precision,
         })
     }
     pub fn max_length(&self) -> usize {
@@ -258,12 +281,15 @@ fn encode(
 }
 impl DecisionEngine for NativeEngine {
     fn model(&self) -> &str {
-        ENGINE_ID
+        self.precision.engine_id()
     }
     fn decide(&self, request: &Request) -> Result<Response, String> {
         request.validate()?;
         if request.model.as_deref().is_some_and(|m| {
-            m != ENGINE_ID && m != "strands-decider-latest" && m != "strands-decider-2B-hobson-v21"
+            m != self.model()
+                && m != ENGINE_ID
+                && m != "strands-decider-latest"
+                && m != "strands-decider-2B-hobson-v21"
         }) {
             return Err("requested model is not this native engine".into());
         }
@@ -441,5 +467,20 @@ mod tests {
             schema::score_confidence(&[0.0, 0.5, 0.5, 0.0], 0.0)
                 > schema::score_confidence(&[0.5, 0.0, 0.0, 0.5], 0.0)
         );
+    }
+
+    #[test]
+    fn lower_precision_modes_identify_themselves_and_preserve_causality() {
+        let request: Request = serde_json::from_str(include_str!("../tests/request.json")).unwrap();
+        for precision in [Precision::Int8, Precision::Int4] {
+            let engine = NativeEngine::load_with_precision(&fixture(), precision).unwrap();
+            let a = engine.model.forward(&[1, 2, 5, 3, 7, 11]).unwrap();
+            let b = engine.model.forward(&[1, 2, 5, 3, 9, 10]).unwrap();
+            assert_eq!(&a[..4 * 8], &b[..4 * 8]);
+            let response = engine.decide(&request).unwrap();
+            assert_eq!(response.model, precision.engine_id());
+            assert_eq!(response.answers.len(), 3);
+            assert_eq!(response.usage.output_tokens, 0);
+        }
     }
 }

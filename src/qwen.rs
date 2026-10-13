@@ -1,7 +1,7 @@
 //! Text-only Qwen3.5: full causal GQA and recurrent Gated DeltaNet.
 //! FP32 arithmetic matches the upstream CPU serving path. No generation or KV cache.
 use crate::tensor::{dot_scores, softmax};
-use crate::weights::{Linear, Weights};
+use crate::weights::{Data, Linear, Weights};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -158,8 +158,8 @@ struct Delta {
     norm: Vec<f32>,
 }
 enum Mixer {
-    Full(Full),
-    Delta(Delta),
+    Full(Box<Full>),
+    Delta(Box<Delta>),
 }
 struct Layer {
     input_norm: Vec<f32>,
@@ -171,7 +171,7 @@ struct Layer {
 }
 pub(crate) struct Model {
     config: Config,
-    embedding: Vec<f32>,
+    embedding: Data,
     layers: Vec<Layer>,
     norm: Vec<f32>,
 }
@@ -196,7 +196,7 @@ impl Model {
                 Ok(l)
             };
             let mixer = if c.layer_types[i] == "full_attention" {
-                Mixer::Full(Full {
+                Mixer::Full(Box::new(Full {
                     q: linear(
                         "self_attn.q_proj",
                         h,
@@ -207,11 +207,11 @@ impl Model {
                     o: linear("self_attn.o_proj", c.num_attention_heads * c.head_dim, h)?,
                     q_norm: w.take(&format!("{p}.self_attn.q_norm.weight"), &[c.head_dim])?,
                     k_norm: w.take(&format!("{p}.self_attn.k_norm.weight"), &[c.head_dim])?,
-                })
+                }))
             } else {
                 let kd = c.linear_key_head_dim * c.linear_num_key_heads;
                 let vd = c.linear_value_head_dim * c.linear_num_value_heads;
-                Mixer::Delta(Delta {
+                Mixer::Delta(Box::new(Delta {
                     qkv: linear("linear_attn.in_proj_qkv", h, 2 * kd + vd)?,
                     z: linear("linear_attn.in_proj_z", h, vd)?,
                     a: linear("linear_attn.in_proj_a", h, c.linear_num_value_heads)?,
@@ -233,7 +233,7 @@ impl Model {
                         &format!("{p}.linear_attn.norm.weight"),
                         &[c.linear_value_head_dim],
                     )?,
-                })
+                }))
             };
             // Finish loading projections before borrowing the weight map for norms.
             let mut load_mlp = |name: &str, input, output| -> Result<Linear, String> {
@@ -254,7 +254,7 @@ impl Model {
                 post_norm: w.take(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
             });
         }
-        let embedding = w.take("embed_tokens.weight", &[c.vocab_size, h])?;
+        let embedding = w.take_data("embed_tokens.weight", &[c.vocab_size, h])?;
         let norm = w.take("norm.weight", &[h])?;
         if adapter.remaining() != 0 {
             return Err(format!(
@@ -281,12 +281,13 @@ impl Model {
         }
         let c = &self.config;
         let mut x = Vec::with_capacity(ids.len() * c.hidden_size);
+        let mut scratch = Vec::new();
         for id in ids {
             if *id as usize >= c.vocab_size {
                 return Err(format!("token {id} outside vocabulary"));
             }
             let offset = *id as usize * c.hidden_size;
-            x.extend_from_slice(&self.embedding[offset..offset + c.hidden_size]);
+            x.extend_from_slice(self.embedding.row(offset, c.hidden_size, &mut scratch));
         }
         for layer in &self.layers {
             let n = normalized(&x, &layer.input_norm, c.rms_norm_eps);

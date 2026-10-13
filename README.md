@@ -24,8 +24,11 @@ target/release/decider-engine models/v21 tests/request.json
 
 The downloader pins the adapter and base revisions and checks the published
 SHA256 hashes of weight files. It also downloads their license files.
-It downloads approximately 4.5 GB; allow at least 16 GB available RAM for loading
-and inference. Weights and arithmetic are FP32; resident model memory is roughly 8 GB.
+It downloads approximately 4.5 GB; allow 8 GB available RAM for initial loading
+and inference. Checkpoint weights retain their original BF16/F16/F32 storage;
+arithmetic, adapters, normalization, recurrent state, and pointer readout use FP32.
+The v21 model occupies roughly 4 GB resident memory. Loading streams tensors
+through a bounded buffer instead of holding a second copy of the checkpoint.
 
 With no request file, stdin accepts one JSON request per line and stdout returns
 one response per line. The model stays loaded until EOF. Blank lines are skipped;
@@ -63,7 +66,7 @@ println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 For a Git dependency:
 
 ```toml
-decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.1.0" }
+decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.1.1" }
 ```
 
 ## Scope and checks
@@ -88,6 +91,30 @@ full-weight test compares three questions against the pinned v21 reference;
 this is a parity check, not a benchmark of decision quality.
 See [fixture provenance](tests/fixtures/README.md).
 Rayon controls parallelism through its standard `RAYON_NUM_THREADS` setting.
+
+## Lower precision and ARM64 Lambda
+
+```sh
+target/release/decider-engine --precision int8 models/v21 tests/request.json
+target/release/decider-engine --precision int4 models/v21 tests/request.json
+```
+
+The library equivalents are `NativeEngine::load_with_precision(path, Precision::Int8)`
+and `Precision::Int4`. Default `load` preserves checkpoint precision.
+INT8 and INT4 quantize only the base linear projections at load, using symmetric
+groups of 64 weights within each output row, FP32 scales, and signed ranges
+[-127, 127] or [-7, 7]. INT4 packs two values per byte. Embeddings retain checkpoint
+precision; adapters, norms, and the pointer head receive no added quantization.
+Rows expand to FP32 in reusable worker buffers before multiplication. These are
+native weight-only modes; GGUF, AWQ, and GPTQ files are not supported.
+
+Responses identify the mode in `model`, with an `-int8` or `-int4` suffix.
+Both are experimental: quantization changes probabilities and can invalidate the
+checkpoint's calibration. Original temperatures are retained; validate accuracy
+and refit calibration for your workload before relying on confidence thresholds.
+Weight compression primarily saves memory; it does not promise faster inference.
+
+See [ARM64 Lambda notes](docs/lambda.md) for build targets, sizing, and limitations.
 
 ## License
 

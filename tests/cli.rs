@@ -54,3 +54,21 @@ fn oversized_input_is_rejected_before_json_parsing() {
         .unwrap()
         .contains("exceeds 2 MiB"));
 }
+
+#[test]
+fn precision_flag_selects_the_requested_engine() {
+    for precision in ["int8", "int4"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_decider-engine"))
+            .args(["--precision", precision])
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny"))
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/request.json"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["model"],
+            format!("strands-decider-2b-native-{precision}")
+        );
+    }
+}

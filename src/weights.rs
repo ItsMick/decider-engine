@@ -1,26 +1,218 @@
 //! Validated F32/BF16/F16 safetensors; no pickle or model code execution.
 use crate::tensor::linear;
-use safetensors::{Dtype, SafeTensors};
-use std::{collections::HashMap, path::Path};
+use crate::Precision;
+use safetensors::{tensor::Metadata, Dtype};
+use std::{
+    collections::HashMap,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
+
+/// Preserve checkpoint precision in memory; arithmetic remains FP32.
+pub(crate) enum Data {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+    F16(Vec<u16>),
+    Quantized {
+        values: Vec<u8>,
+        scales: Vec<f32>,
+        width: usize,
+        elements: usize,
+        bits: u8,
+    },
+}
+impl Data {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::Bf16(v) | Self::F16(v) => v.len(),
+            Self::Quantized { elements, .. } => *elements,
+        }
+    }
+    pub fn row<'a>(&'a self, start: usize, len: usize, scratch: &'a mut Vec<f32>) -> &'a [f32] {
+        match self {
+            Self::F32(v) => &v[start..start + len],
+            Self::Bf16(v) => {
+                scratch.clear();
+                scratch.extend(
+                    v[start..start + len]
+                        .iter()
+                        .map(|v| f32::from_bits((*v as u32) << 16)),
+                );
+                scratch
+            }
+            Self::F16(v) => {
+                scratch.clear();
+                scratch.extend(v[start..start + len].iter().map(|v| half(*v)));
+                scratch
+            }
+            Self::Quantized {
+                values,
+                scales,
+                width,
+                bits,
+                ..
+            } => {
+                let groups = width.div_ceil(64);
+                scratch.clear();
+                scratch.reserve(len);
+                let mut position = start;
+                while position < start + len {
+                    let row = position / width;
+                    let offset = position % width;
+                    let count = (start + len - position)
+                        .min(64 - offset % 64)
+                        .min(width - offset);
+                    let scale = scales[row * groups + offset / 64];
+                    scratch.extend((position..position + count).map(|i| {
+                        let q = if *bits == 8 {
+                            values[i] as i8 as f32
+                        } else {
+                            let nibble = (values[i / 2] >> (4 * (i % 2))) & 15;
+                            nibble as f32 - 8.0
+                        };
+                        q * scale
+                    }));
+                    position += count;
+                }
+                scratch
+            }
+        }
+    }
+    fn into_f32(self) -> Vec<f32> {
+        match self {
+            Self::F32(v) => v,
+            Self::Bf16(v) => v
+                .into_iter()
+                .map(|v| f32::from_bits((v as u32) << 16))
+                .collect(),
+            Self::F16(v) => v.into_iter().map(half).collect(),
+            data @ Self::Quantized { .. } => {
+                let mut result = Vec::new();
+                data.row(0, data.len(), &mut result);
+                result
+            }
+        }
+    }
+    fn quantize(self, width: usize, precision: Precision) -> Self {
+        let bits = match precision {
+            Precision::Checkpoint => return self,
+            Precision::Int8 => 8,
+            Precision::Int4 => 4,
+        };
+        let elements = self.len();
+        assert!(width > 0 && elements.is_multiple_of(width));
+        let mut values = vec![
+            0;
+            if bits == 8 {
+                elements
+            } else {
+                elements.div_ceil(2)
+            }
+        ];
+        let mut scales = Vec::with_capacity((elements / width) * width.div_ceil(64));
+        let mut scratch = Vec::new();
+        let bound = if bits == 8 { 127.0 } else { 7.0 };
+        for row in 0..elements / width {
+            let weights = self.row(row * width, width, &mut scratch);
+            for (group, weights) in weights.chunks(64).enumerate() {
+                let max = weights.iter().map(|v| v.abs()).fold(0.0, f32::max);
+                let scale = if max == 0.0 {
+                    1.0
+                } else {
+                    (max / bound).max(f32::MIN_POSITIVE)
+                };
+                scales.push(scale);
+                for (offset, weight) in weights.iter().enumerate() {
+                    let index = row * width + group * 64 + offset;
+                    let q = (weight / scale).round().clamp(-bound, bound) as i8;
+                    if bits == 8 {
+                        values[index] = q as u8;
+                    } else {
+                        values[index / 2] |= ((q + 8) as u8) << (4 * (index % 2));
+                    }
+                }
+            }
+        }
+        Self::Quantized {
+            values,
+            scales,
+            width,
+            elements,
+            bits,
+        }
+    }
+    fn read(reader: &mut impl Read, bytes: usize, dtype: Dtype) -> Result<Self, String> {
+        let stride = match dtype {
+            Dtype::F32 => 4,
+            Dtype::BF16 | Dtype::F16 => 2,
+            _ => return Err(format!("unsupported weight dtype {dtype:?}")),
+        };
+        if !bytes.is_multiple_of(stride) {
+            return Err("misaligned tensor data".into());
+        }
+        let mut data = match dtype {
+            Dtype::F32 => Self::F32(Vec::with_capacity(bytes / stride)),
+            Dtype::BF16 => Self::Bf16(Vec::with_capacity(bytes / stride)),
+            _ => Self::F16(Vec::with_capacity(bytes / stride)),
+        };
+        // A bounded transfer buffer avoids retaining a whole checkpoint or tensor twice.
+        let mut buffer = vec![0; bytes.min(1024 * 1024)];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let count = remaining.min(buffer.len());
+            reader
+                .read_exact(&mut buffer[..count])
+                .map_err(|e| e.to_string())?;
+            match &mut data {
+                Self::F32(v) => {
+                    for c in buffer[..count].as_chunks::<4>().0 {
+                        let value = f32::from_le_bytes(*c);
+                        if !value.is_finite() {
+                            return Err("non-finite weights".into());
+                        }
+                        v.push(value);
+                    }
+                }
+                Self::Bf16(v) | Self::F16(v) => {
+                    let mask = if dtype == Dtype::BF16 { 0x7f80 } else { 0x7c00 };
+                    for c in buffer[..count].as_chunks::<2>().0 {
+                        let value = u16::from_le_bytes(*c);
+                        if value & mask == mask {
+                            return Err("non-finite weights".into());
+                        }
+                        v.push(value);
+                    }
+                }
+                Self::Quantized { .. } => unreachable!("quantization is applied after reading"),
+            }
+            remaining -= count;
+        }
+        Ok(data)
+    }
+}
 
 pub(crate) struct Tensor {
-    pub data: Vec<f32>,
+    pub data: Data,
     pub shape: Vec<usize>,
 }
 pub(crate) struct Weights {
     tensors: HashMap<String, Tensor>,
+    precision: Precision,
 }
 impl Weights {
     pub fn file(path: &Path, prefix: Option<&str>) -> Result<Self, String> {
         let mut w = Self {
             tensors: HashMap::new(),
+            precision: Precision::Checkpoint,
         };
         w.extend(path, prefix)?;
         Ok(w)
     }
-    pub fn base(dir: &Path) -> Result<Self, String> {
+    pub fn base(dir: &Path, precision: Precision) -> Result<Self, String> {
         let mut w = Self {
             tensors: HashMap::new(),
+            precision,
         };
         let single = dir.join("model.safetensors");
         if single.exists() {
@@ -60,39 +252,18 @@ impl Weights {
         Ok(w)
     }
     fn extend(&mut self, path: &Path, prefix: Option<&str>) -> Result<(), String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let st =
-            SafeTensors::deserialize(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        for (name, t) in st.tensors() {
-            let name = if let Some(p) = prefix {
-                match name.strip_prefix(p) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                }
-            } else {
-                name
-            };
-            let data = decode(t.data(), t.dtype())?;
-            if data.iter().any(|v| !v.is_finite()) {
-                return Err(format!("non-finite weights in {name}"));
-            }
-            if self
-                .tensors
-                .insert(
-                    name.clone(),
-                    Tensor {
-                        data,
-                        shape: t.shape().to_vec(),
-                    },
-                )
-                .is_some()
-            {
+        let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let length = file.metadata().map_err(|e| e.to_string())?.len();
+        for (name, tensor) in read_tensors(&mut file, length, prefix, self.precision)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+        {
+            if self.tensors.insert(name.clone(), tensor).is_some() {
                 return Err(format!("duplicate tensor {name}"));
             }
         }
         Ok(())
     }
-    pub fn take(&mut self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
+    pub fn take_data(&mut self, name: &str, shape: &[usize]) -> Result<Data, String> {
         let t = self
             .tensors
             .remove(name)
@@ -102,6 +273,9 @@ impl Weights {
         }
         Ok(t.data)
     }
+    pub fn take(&mut self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
+        Ok(self.take_data(name, shape)?.into_f32())
+    }
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
@@ -110,29 +284,67 @@ impl Weights {
     }
 }
 
-fn decode(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>, String> {
-    match dtype {
-        Dtype::F32 => Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect()),
-        Dtype::BF16 => Ok(bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
-            .collect()),
-        Dtype::F16 => Ok(bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| half(u16::from_le_bytes(*c)))
-            .collect()),
-        _ => Err(format!("unsupported weight dtype {dtype:?}")),
+fn read_tensors(
+    reader: &mut (impl Read + Seek),
+    length: u64,
+    prefix: Option<&str>,
+    precision: Precision,
+) -> Result<HashMap<String, Tensor>, String> {
+    let mut size = [0; 8];
+    reader.read_exact(&mut size).map_err(|e| e.to_string())?;
+    let header_size = u64::from_le_bytes(size);
+    if header_size > 16 * 1024 * 1024 || header_size + 8 > length {
+        return Err("invalid or oversized safetensors header".into());
     }
+    let mut header = vec![0; header_size as usize];
+    reader.read_exact(&mut header).map_err(|e| e.to_string())?;
+    // Metadata deserialization validates shapes, ordered offsets and byte counts.
+    let metadata: Metadata = serde_json::from_slice(&header).map_err(|e| e.to_string())?;
+    let start = header_size + 8;
+    if start.checked_add(metadata.data_len() as u64) != Some(length) {
+        return Err("safetensors file length does not match metadata".into());
+    }
+    let mut tensors = HashMap::new();
+    for original in metadata.offset_keys() {
+        let info = metadata.info(&original).ok_or("missing tensor metadata")?;
+        let name = if let Some(p) = prefix {
+            match original.strip_prefix(p) {
+                Some(n) => n.to_string(),
+                None => continue,
+            }
+        } else {
+            original
+        };
+        reader
+            .seek(SeekFrom::Start(start + info.data_offsets.0 as u64))
+            .map_err(|e| e.to_string())?;
+        let mut data = Data::read(
+            reader,
+            info.data_offsets.1 - info.data_offsets.0,
+            info.dtype,
+        )
+        .map_err(|e| format!("{name}: {e}"))?;
+        if name.starts_with("layers.")
+            && name.contains("_proj")
+            && name.ends_with(".weight")
+            && info.shape.len() == 2
+        {
+            if info.shape[1] == 0 {
+                return Err("zero-width projection".into());
+            }
+            data = data.quantize(info.shape[1], precision);
+        }
+        tensors.insert(
+            name,
+            Tensor {
+                data,
+                shape: info.shape.clone(),
+            },
+        );
+    }
+    Ok(tensors)
 }
+
 fn half(v: u16) -> f32 {
     let sign = if v & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (v >> 10) & 31;
@@ -151,11 +363,11 @@ fn half(v: u16) -> f32 {
 }
 
 pub(crate) struct Linear {
-    w: Vec<f32>,
+    w: Data,
     bias: Option<Vec<f32>>,
     pub input: usize,
     pub output: usize,
-    lora: Option<(Vec<f32>, Vec<f32>, usize, f32)>,
+    lora: Option<(Data, Data, usize, f32)>,
 }
 impl Linear {
     pub fn load(
@@ -166,7 +378,7 @@ impl Linear {
         bias: bool,
     ) -> Result<Self, String> {
         Ok(Self {
-            w: w.take(&format!("{prefix}.weight"), &[output, input])?,
+            w: w.take_data(&format!("{prefix}.weight"), &[output, input])?,
             bias: if bias {
                 Some(w.take(&format!("{prefix}.bias"), &[output])?)
             } else {
@@ -192,8 +404,8 @@ impl Linear {
             return Err(format!("missing required LoRA pair for {prefix}"));
         }
         self.lora = Some((
-            w.take(&a, &[rank, self.input])?,
-            w.take(&b, &[self.output, rank])?,
+            w.take_data(&a, &[rank, self.input])?,
+            w.take_data(&b, &[self.output, rank])?,
             rank,
             scale,
         ));
@@ -230,12 +442,119 @@ mod tests {
     #[test]
     fn half_and_bfloat_readout() {
         assert_eq!(
-            decode(&[0x80, 0x3f, 0x00, 0xc0], Dtype::BF16).unwrap(),
+            Data::read(&mut &[0x80, 0x3f, 0x00, 0xc0][..], 4, Dtype::BF16)
+                .unwrap()
+                .into_f32(),
             vec![1.0, -2.0]
         );
         assert_eq!(half(0x3c00), 1.0);
         assert_eq!(half(0xc000), -2.0);
         assert_eq!(half(1), 2f32.powi(-24));
-        assert!(decode(&[0], Dtype::I8).is_err());
+        assert!(Data::read(&mut &[0][..], 1, Dtype::I8).is_err());
+    }
+
+    #[test]
+    fn packed_projections_match_fp32_without_quantization() {
+        let (rows, input, output) = (19, 13, 31);
+        let x: Vec<_> = (0..rows * input).map(|i| (i % 17) as f32 / 7.0).collect();
+        for dtype in [Dtype::BF16, Dtype::F16] {
+            let bytes: Vec<_> = (0..input * output)
+                .flat_map(|i| (0x3800 + (i % 31) as u16).to_le_bytes())
+                .collect();
+            let packed = Data::read(&mut bytes.as_slice(), bytes.len(), dtype).unwrap();
+            let expanded = Data::F32(
+                Data::read(&mut bytes.as_slice(), bytes.len(), dtype)
+                    .unwrap()
+                    .into_f32(),
+            );
+            let mut a = vec![0.0; rows * output];
+            let mut b = a.clone();
+            linear(&x, rows, input, &packed, output, None, &mut a);
+            linear(&x, rows, input, &expanded, output, None, &mut b);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn transfer_buffer_is_bounded_and_bf16_is_retained() {
+        struct Reader {
+            inner: std::io::Cursor<Vec<u8>>,
+            max: usize,
+        }
+        impl Read for Reader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.max = self.max.max(buffer.len());
+                self.inner.read(buffer)
+            }
+        }
+        let size = 2 * 1024 * 1024 + 2;
+        let mut reader = Reader {
+            inner: std::io::Cursor::new(vec![0; size]),
+            max: 0,
+        };
+        let data = Data::read(&mut reader, size, Dtype::BF16).unwrap();
+        assert!(matches!(data, Data::Bf16(v) if v.len() == size / 2));
+        assert!(reader.max <= 1024 * 1024);
+    }
+
+    #[test]
+    fn streaming_metadata_rejects_invalid_offsets_lengths_and_values() {
+        fn load(header: serde_json::Value, data: &[u8]) -> Result<HashMap<String, Tensor>, String> {
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(&header);
+            bytes.extend_from_slice(data);
+            let len = bytes.len() as u64;
+            read_tensors(
+                &mut std::io::Cursor::new(bytes),
+                len,
+                Some("text."),
+                Precision::Checkpoint,
+            )
+        }
+        let valid = serde_json::json!({"text.w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"vision.w":{"dtype":"I8","shape":[1],"data_offsets":[2,3]}});
+        let mut tensors = load(valid.clone(), &[0x80, 0x3f, 0]).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors.remove("w").unwrap().data.into_f32(), vec![1.0]);
+        assert!(load(valid.clone(), &[0x80, 0x3f]).is_err());
+        assert!(load(valid.clone(), &[0x80, 0x3f, 0, 0]).is_err());
+        assert!(load(valid, &[0x80, 0x7f, 0]).is_err());
+        assert!(load(
+            serde_json::json!({"text.w":{"dtype":"BF16","shape":[1],"data_offsets":[1,3]}}),
+            &[0, 0, 0]
+        )
+        .is_err());
+        let mut oversized = std::io::Cursor::new(u64::MAX.to_le_bytes());
+        assert!(read_tensors(&mut oversized, u64::MAX, None, Precision::Checkpoint).is_err());
+        for dtype in [Dtype::F32, Dtype::BF16, Dtype::F16] {
+            assert!(Data::read(&mut &[0][..], 2, dtype).is_err());
+        }
+    }
+
+    #[test]
+    fn quantization_bounds_error_and_handles_odd_rows_partial_groups_and_zeroes() {
+        let width = 131;
+        let weights: Vec<_> = (0..width * 3)
+            .map(|i| {
+                if i < width {
+                    0.0
+                } else {
+                    ((i % 113) as f32 - 56.0) / 19.0
+                }
+            })
+            .collect();
+        for (precision, bound) in [(Precision::Int8, 127.0), (Precision::Int4, 7.0)] {
+            let data = Data::F32(weights.clone()).quantize(width, precision);
+            assert_eq!(data.len(), weights.len());
+            let restored = data.into_f32();
+            for (a, b) in weights.chunks(width).zip(restored.chunks(width)) {
+                for (a, b) in a.chunks(64).zip(b.chunks(64)) {
+                    let max = a.iter().map(|v| v.abs()).fold(0.0, f32::max);
+                    for (a, b) in a.iter().zip(b) {
+                        assert!((a - b).abs() <= max / (2.0 * bound) + 1e-6);
+                    }
+                }
+            }
+        }
     }
 }

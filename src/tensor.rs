@@ -1,4 +1,5 @@
 //! Small portable FP32 kernels. Each parallel job owns a disjoint output slice.
+use crate::weights::Data;
 use rayon::prelude::*;
 
 pub(crate) fn dot_scores(a: &[f32], b: &[f32]) -> f32 {
@@ -8,7 +9,11 @@ pub(crate) fn dot_scores(a: &[f32], b: &[f32]) -> f32 {
     let mut lanes = [0.0; 8];
     for (a, b) in a_chunks.iter().zip(b_chunks) {
         for i in 0..8 {
-            lanes[i] += a[i] * b[i];
+            if cfg!(target_arch = "aarch64") {
+                lanes[i] = a[i].mul_add(b[i], lanes[i]);
+            } else {
+                lanes[i] += a[i] * b[i];
+            }
         }
     }
     let mut sum = lanes.iter().sum::<f32>();
@@ -23,7 +28,7 @@ pub(crate) fn linear(
     x: &[f32],
     rows: usize,
     input: usize,
-    weights: &[f32],
+    weights: &Data,
     output: usize,
     bias: Option<&[f32]>,
     result: &mut [f32],
@@ -35,8 +40,8 @@ pub(crate) fn linear(
     if rows == 0 {
         return;
     }
-    let compute = |column: usize, dst: &mut [f32]| {
-        let w = &weights[column * input..(column + 1) * input];
+    let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
+        let w = weights.row(column * input, input, scratch);
         let b = bias.map_or(0.0, |b| b[column]);
         for (value, token) in dst.iter_mut().zip(x.chunks_exact(input)) {
             *value = dot_scores(token, w) + b;
@@ -47,10 +52,13 @@ pub(crate) fn linear(
         columns
             .par_chunks_mut(rows)
             .enumerate()
-            .for_each(|(column, dst)| compute(column, dst));
+            .for_each_init(Vec::new, |scratch, (column, dst)| {
+                compute(column, dst, scratch)
+            });
     } else {
+        let mut scratch = Vec::new();
         for (column, dst) in columns.chunks_mut(rows).enumerate() {
-            compute(column, dst);
+            compute(column, dst, &mut scratch);
         }
     }
     for (row, dst) in result.chunks_exact_mut(output).enumerate() {
@@ -85,7 +93,15 @@ mod tests {
         let w: Vec<_> = (0..output * input).map(|i| (i % 7) as f32 - 3.0).collect();
         let b: Vec<_> = (0..output).map(|i| i as f32 * 0.5).collect();
         let mut y = vec![0.0; rows * output];
-        linear(&x, rows, input, &w, output, Some(&b), &mut y);
+        linear(
+            &x,
+            rows,
+            input,
+            &Data::F32(w.clone()),
+            output,
+            Some(&b),
+            &mut y,
+        );
         for row in 0..rows {
             for col in 0..output {
                 let expected = b[col]
