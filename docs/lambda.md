@@ -93,6 +93,25 @@ Lambda. The native INT4 mode here uses simple symmetric rounding, without
 activation-aware calibration or GPTQ error compensation. It should not be
 treated as equivalent to those methods or as an AWS-endorsed preset.
 
+## ARM kernel check
+
+[CI run 38388086320](https://github.com/ItsMick/decider-engine/actions/runs/38388086320)
+executed the accelerated kernel on a Linux ARM64 runner with `SDOT` detected,
+four Rayon workers and `-C target-cpu=neoverse-n1`. A warmed synthetic
+2048-by-2048 projection averaged three timed runs per mode:
+
+| Input tokens | INT8 weights, FP32 compute (ms) | INT8 compute (ms) |
+| ---: | ---: | ---: |
+| 1 | 1.429 | 0.110 |
+| 32 | 5.477 | 1.954 |
+| 128 | 24.021 | 7.398 |
+
+Input quantization and weight dequantization are included. The 32/128-token
+projections were about 2.8/3.2 times faster with integer computation. This is
+one synthetic CI measurement on an ARM runner, not measured on Graviton2.
+It excludes model loading, other operators, real checkpoint weights and Lambda
+overhead. It does not establish an end-to-end speedup or cost improvement.
+
 ## Local memory check
 
 One run per mode, Linux x86_64, six Rayon workers, the pinned v21 checkpoint,
@@ -112,6 +131,14 @@ quantized modes, while ordinal scores and probabilities changed. Three questions
 are a smoke check, not a quality benchmark or calibration validation. These
 numbers are not ARM64 or Lambda measurements, and one run is insufficient for
 a reliable latency comparison. Lambda memory accounting can differ from RSS.
+
+A separate v0.1.2 full-model `int8-compute` smoke check on Linux x86_64 used
+the portable integer fallback, six workers and the same three questions.
+Peak RSS was 2.49 GiB; the largest probability shift from checkpoint precision
+was 0.01273 (about 1.3 percentage points), versus 0.00496 for weight-only INT8.
+The categorical choice remained the same. This small sample does not validate
+decision quality or calibration; the original checkpoint temperatures remain
+unchanged.
 
 Lambda deployment and real-weight performance on Graviton have not been tested
 by this project. Native ARM64 CI verifies compilation and synthetic numerical
