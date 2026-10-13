@@ -123,6 +123,45 @@ one synthetic CI measurement on an ARM runner, not measured on Graviton2.
 It excludes model loading, other operators, real checkpoint weights and Lambda
 overhead. It does not establish an end-to-end speedup or cost improvement.
 
+## Forward-pass checks
+
+[CI run 38392563538](https://github.com/ItsMick/decider-engine/actions/runs/38392563538)
+compared the same causal attention implementation with one and four Rayon
+workers on Linux ARM64, Rust 1.98, Neoverse N1 compiler flags. Synthetic inputs
+used eight query heads, two key/value heads and head dimension 256. Each result
+is the mean of three warmed operations, including output and score allocation:
+
+| Tokens | One worker (ms) | Four workers (ms) |
+| ---: | ---: | ---: |
+| 32 | 0.352 | 0.181 |
+| 128 | 5.496 | 1.577 |
+| 512 | 103.314 | 44.315 |
+
+The 128-token attention operator was about 3.5 times faster with four workers.
+This measures additional CPU parallelism within attention, not the complete
+forward pass. It is not a Lambda measurement or a one-core speedup.
+
+A separate local full-model comparison of v0.2.0 and v0.2.1 used Rust 1.98,
+Linux x86_64, six Rayon workers and the pinned v21 checkpoint. Each binary/mode
+ran in a separate resident process: initialization and the first request were
+excluded, followed by three repeated requests using the three questions in
+`tests/request.json` (261 bound tokens in total). Warm medians were:
+
+| Mode | v0.2.0 (s) | v0.2.1 (s) |
+| --- | ---: | ---: |
+| Checkpoint | 7.517 | 7.378 |
+| INT8 weights | 7.988 | 7.931 |
+| INT8 compute, portable integer fallback | 15.081 | 14.840 |
+| INT4 weights | 8.189 | 8.075 |
+
+Every response, including probabilities and confidence, was exactly unchanged
+within each precision mode. Improvements on this short sample were only about
+0.7–1.9%; three repeated requests on one workload do not establish a general
+speedup. New buffers are scoped to a forward pass or Rayon job. The published
+model's six full-attention layers and ten query/key heads share each rotary
+sine/cosine pair, reducing those calculations by a factor of 60. Quantization,
+temperatures and the order of attention reductions are unchanged.
+
 ## Local memory check
 
 One run per mode, Linux x86_64, six Rayon workers, the pinned v21 checkpoint,
