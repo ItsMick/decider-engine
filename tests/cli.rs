@@ -57,7 +57,7 @@ fn oversized_input_is_rejected_before_json_parsing() {
 
 #[test]
 fn precision_flag_selects_the_requested_engine() {
-    for precision in ["int8", "int4"] {
+    for precision in ["int8", "int8-compute", "int4"] {
         let output = Command::new(env!("CARGO_BIN_EXE_decider-engine"))
             .args(["--precision", precision])
             .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny"))

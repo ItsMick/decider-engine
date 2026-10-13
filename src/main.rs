@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
 const LIMIT: usize = 2 * 1024 * 1024;
-const HELP: &str = "Usage: decider-engine [--precision checkpoint|int8|int4] MODEL_DIR [REQUEST_JSON]\n\nWith a file, evaluate one JSON request. Otherwise read JSONL from stdin,\nkeeping the model resident, and write one JSON response per line.\nINT8/INT4 are experimental weight-only modes; confidence needs evaluation.\nMaximum request size: 2 MiB. No network access during inference.\n";
+const HELP: &str = "Usage: decider-engine [--precision checkpoint|int8|int8-compute|int4] MODEL_DIR [REQUEST_JSON]\n\nWith a file, evaluate one JSON request. Otherwise read JSONL from stdin,\nkeeping the model resident, and write one JSON response per line.\nQuantized modes are experimental; confidence needs evaluation.\nINT8-compute also quantizes projection inputs and enables ARM dot products.\nMaximum request size: 2 MiB. No network access during inference.\n";
 
 fn answer(engine: &NativeEngine, bytes: &[u8], out: &mut impl Write) -> Result<(), String> {
     if bytes.len() > LIMIT {
@@ -30,8 +30,9 @@ fn run() -> Result<(), String> {
         let precision = match args[1].to_str() {
             Some("checkpoint") => Precision::Checkpoint,
             Some("int8") => Precision::Int8,
+            Some("int8-compute") => Precision::Int8Compute,
             Some("int4") => Precision::Int4,
-            _ => return Err("precision must be checkpoint, int8, or int4".into()),
+            _ => return Err("precision must be checkpoint, int8, int8-compute, or int4".into()),
         };
         args.drain(..2);
         precision

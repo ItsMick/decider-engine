@@ -28,6 +28,32 @@ FP32 `mul_add` enables native fused multiply-add on AArch64; numerical results c
 differ in their last digits. CI exercises the Neoverse N1 target on Linux ARM64
 and the portable target on Apple ARM64, with synthetic parity fixtures.
 
+`--precision int8-compute` / `Precision::Int8Compute` enables dynamic INT8
+projection inputs and INT32 dot products for base projections. Graviton2 supports
+NEON `SDOT` and the engine detects it at runtime. The existing `int8` mode is
+weight-only and still computes in FP32. INT4 requires unpacking; there is no
+native INT4 dot-product path here. Graviton2 also lacks native BF16 arithmetic;
+do not assume Graviton3/4 BF16 or SVE optimizations apply to Lambda.
+See the [AWS SIMD guide](https://aws.github.io/graviton/SIMD_and_vectorization.html)
+and [processor comparison](https://aws.github.io/graviton/).
+
+Integer inputs use symmetric groups of 64, quantized once per projection and
+reused across output rows. Group accumulators are scaled back to FP32 before
+summing. LoRA, attention, recurrent state and the pointer head stay FP32.
+This adds input-rounding error beyond weight-only INT8 and requires separate
+decision-quality and calibration validation. It is not a full-model W8A8 or
+SmoothQuant implementation. Unsupported CPUs use a scalar integer fallback;
+non-finite inputs use the weight-only FP32 path.
+
+To compare synthetic 2048-by-2048 projections at 1, 32 and 128 input tokens:
+
+```sh
+RAYON_NUM_THREADS=4 cargo test --release --locked --lib benchmark_int8_projections -- --ignored --nocapture
+```
+
+ARM CI runs this comparison, including input quantization and weight-only
+dequantization in the timed operation. It is not a full-model or Lambda benchmark.
+
 The full checkpoint download is approximately 4.5 GB and will not fit Lambda's
 250 MB unzipped ZIP/layer package limit. A container image can hold the model and
 its licenses within the 10 GB uncompressed image limit. Alternatively provision

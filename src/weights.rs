@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-/// Preserve checkpoint precision in memory; arithmetic remains FP32.
+/// Preserve checkpoint precision or quantize selected base projections.
 pub(crate) enum Data {
     F32(Vec<f32>),
     Bf16(Vec<u16>),
@@ -19,6 +19,7 @@ pub(crate) enum Data {
         width: usize,
         elements: usize,
         bits: u8,
+        compute_int8: bool,
     },
 }
 impl Data {
@@ -97,7 +98,7 @@ impl Data {
     fn quantize(self, width: usize, precision: Precision) -> Self {
         let bits = match precision {
             Precision::Checkpoint => return self,
-            Precision::Int8 => 8,
+            Precision::Int8 | Precision::Int8Compute => 8,
             Precision::Int4 => 4,
         };
         let elements = self.len();
@@ -140,6 +141,7 @@ impl Data {
             width,
             elements,
             bits,
+            compute_int8: precision == Precision::Int8Compute,
         }
     }
     fn read(reader: &mut impl Read, bytes: usize, dtype: Dtype) -> Result<Self, String> {

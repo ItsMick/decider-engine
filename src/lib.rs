@@ -3,8 +3,9 @@
 //! CPU kernels and model inference are implemented in this crate.
 //! Loading never downloads or executes Python. Requests over the trained window
 //! are rejected in full rather than silently losing state or options.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+mod int8;
 mod prompt;
 mod qwen;
 pub mod schema;
@@ -25,6 +26,8 @@ pub enum Precision {
     #[default]
     Checkpoint,
     Int8,
+    /// Experimental INT8 weights and dynamically quantized projection inputs.
+    Int8Compute,
     Int4,
 }
 impl Precision {
@@ -32,6 +35,7 @@ impl Precision {
         match self {
             Self::Checkpoint => ENGINE_ID,
             Self::Int8 => "strands-decider-2b-native-int8",
+            Self::Int8Compute => "strands-decider-2b-native-int8-compute",
             Self::Int4 => "strands-decider-2b-native-int4",
         }
     }
@@ -126,7 +130,8 @@ impl NativeEngine {
     pub fn load(dir: &Path) -> Result<Self, String> {
         Self::load_with_precision(dir, Precision::Checkpoint)
     }
-    /// INT8/INT4 are weight-only, groupwise symmetric modes, not GGUF/AWQ formats.
+    /// Groupwise symmetric modes, not GGUF/AWQ formats. `Int8Compute` also
+    /// quantizes projection inputs and uses ARM dot products when available.
     pub fn load_with_precision(dir: &Path, precision: Precision) -> Result<Self, String> {
         let config_path = if dir.join("strands_decider_config.json").exists() {
             dir.join("strands_decider_config.json")
@@ -472,7 +477,7 @@ mod tests {
     #[test]
     fn lower_precision_modes_identify_themselves_and_preserve_causality() {
         let request: Request = serde_json::from_str(include_str!("../tests/request.json")).unwrap();
-        for precision in [Precision::Int8, Precision::Int4] {
+        for precision in [Precision::Int8, Precision::Int8Compute, Precision::Int4] {
             let engine = NativeEngine::load_with_precision(&fixture(), precision).unwrap();
             let a = engine.model.forward(&[1, 2, 5, 3, 7, 11]).unwrap();
             let b = engine.model.forward(&[1, 2, 5, 3, 9, 10]).unwrap();
