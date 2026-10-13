@@ -104,14 +104,16 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[test]
-    fn arm_ci_requires_and_exercises_dotprod() {
-        // Fail on ARM runners without support instead of silently testing only
-        // the fallback. Production still supports ARM CPUs without dotprod.
+    fn arm_kernel_matches_forced_scalar_fallback() {
+        // Our ARM CI explicitly requires acceleration. Other ARM users can run
+        // the default test suite on CPUs that only support the scalar fallback.
         let kernel = Kernel::detect();
-        assert!(
-            kernel.dotprod,
-            "ARM CI must exercise the accelerated kernel"
-        );
+        if std::env::var("DECIDER_REQUIRE_DOTPROD").as_deref() == Ok("1") {
+            assert!(
+                kernel.dotprod,
+                "ARM CI must exercise the accelerated kernel"
+            );
+        }
         let fallback = Kernel { dotprod: false };
         for len in 0..=64 {
             let a: Vec<_> = (0..len).map(|i| (i * 43) as i8).collect();

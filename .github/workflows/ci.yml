@@ -30,6 +30,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+        env:
+          DECIDER_REQUIRE_DOTPROD: ${{ (matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest') && '1' || '0' }}
       - name: Measure synthetic ARM projections
         if: matrix.os == 'ubuntu-24.04-arm'
         env:

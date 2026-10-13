@@ -69,7 +69,7 @@ println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 For a Git dependency:
 
 ```toml
-decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.1.2" }
+decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.1.3" }
 ```
 
 ## Scope and checks
