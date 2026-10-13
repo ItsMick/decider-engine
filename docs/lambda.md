@@ -96,21 +96,20 @@ treated as equivalent to those methods or as an AWS-endorsed preset.
 
 ## ARM kernel check
 
-[CI run 38388086320](https://github.com/ItsMick/decider-engine/actions/runs/38388086320)
+[CI run 38390317785](https://github.com/ItsMick/decider-engine/actions/runs/38390317785)
 executed the accelerated kernel on a Linux ARM64 runner with `SDOT` detected,
-four Rayon workers and `-C target-cpu=neoverse-n1`. A warmed synthetic
-2048-by-2048 projection averaged three timed runs per mode. These historical
-v0.1.2 measurements used inline `SDOT` assembly; v0.2.0 replaces it with the
-stable Rust intrinsic and CI reruns the same benchmark:
+four Rayon workers, Rust 1.98 and `-C target-cpu=neoverse-n1`. The v0.2.0
+kernel uses the stable `vdotq_s32` intrinsic. A warmed synthetic 2048-by-2048
+projection averaged three timed runs per mode:
 
 | Input tokens | INT8 weights, FP32 compute (ms) | INT8 compute (ms) |
 | ---: | ---: | ---: |
-| 1 | 1.429 | 0.110 |
-| 32 | 5.477 | 1.954 |
-| 128 | 24.021 | 7.398 |
+| 1 | 1.219 | 0.097 |
+| 32 | 4.432 | 1.866 |
+| 128 | 21.828 | 7.220 |
 
 Input quantization and weight dequantization are included. The 32/128-token
-projections were about 2.8/3.2 times faster with integer computation. This is
+projections were about 2.4/3.0 times faster with integer computation. This is
 one synthetic CI measurement on an ARM runner, not measured on Graviton2.
 It excludes model loading, other operators, real checkpoint weights and Lambda
 overhead. It does not establish an end-to-end speedup or cost improvement.
