@@ -162,6 +162,46 @@ model's six full-attention layers and ten query/key heads share each rotary
 sine/cosine pair, reducing those calculations by a factor of 60. Quantization,
 temperatures and the order of attention reductions are unchanged.
 
+## Projection fusion checks
+
+The runtime combines LoRA scaling/addition with the final projection write.
+MLP up projection writes SwiGLU directly into the completed gate, and down
+projection adds directly to the residual. Post-attention residual addition,
+copying and RMS statistics also share a pass. This avoids separate row-major
+adapter-delta, up and down outputs. Column buffers and low-rank intermediates
+remain. Batches below 64 tokens interleave base and adapter dot products;
+larger batches keep their dot passes separate to avoid the regression observed
+with the interleaved schedule. Original FP32 arithmetic order is retained.
+Scalar INT8 compute keeps its separate projection plan after a local alternating
+full-model check showed a fusion cost. Native ARM INT8 compute uses the fused
+path. Residual/RMS fusion remains portable.
+
+[CI run 38396454538](https://github.com/ItsMick/decider-engine/actions/runs/38396454538)
+compared fused and unfused synthetic LoRA plus SwiGLU projections in the same
+Linux ARM64 process, Rust 1.98, four workers and Neoverse N1 compiler flags.
+Shape was 2048 inputs, 6144 outputs and LoRA rank 16. Each value is the mean of
+three warmed operations, including temporary allocation and final writes:
+
+| Precision | Tokens | Unfused (ms) | Fused (ms) |
+| --- | ---: | ---: | ---: |
+| Checkpoint | 32 | 13.801 | 11.793 |
+| Checkpoint | 128 | 96.310 | 97.961 |
+| INT8 compute | 32 | 7.890 | 7.573 |
+| INT8 compute | 128 | 30.254 | 29.630 |
+
+The shorter checkpoint projection was about 15% faster; the longer one was
+about 2% slower in this run. INT8 compute gains were small. This is an isolated
+operator check on an ARM runner, not a uniform speedup, statistical validation,
+or a Lambda result. Default tests compare fused operations against separate
+projections in every precision, including both batch schedules, and compare
+combined residual normalization against the unfused version.
+
+To repeat the operator check:
+
+```sh
+RAYON_NUM_THREADS=4 cargo test --release --locked --lib benchmark_fused_projection -- --ignored --nocapture
+```
+
 ## Local memory check
 
 One run per mode, Linux x86_64, six Rayon workers, the pinned v21 checkpoint,

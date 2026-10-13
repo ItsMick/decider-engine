@@ -105,6 +105,8 @@ down and separate row-major adapter-delta tensors. Post-attention residual addit
 RMS statistics share a pass. Low-rank intermediates and projection column buffers
 remain. Batches of at least 64 tokens keep base and adapter dot passes separate;
 smaller batches interleave them. The floating-point arithmetic order is preserved.
+Scalar INT8 compute retains a separate projection plan after benchmarking showed
+a cost for fusion on that fallback. Native ARM INT8 compute uses fused writes.
 
 ## Lower precision and ARM64 Lambda
 

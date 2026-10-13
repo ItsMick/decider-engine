@@ -10,6 +10,18 @@ pub(crate) struct Kernel {
 }
 
 impl Kernel {
+    #[inline]
+    pub(crate) fn accelerated(&self) -> bool {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        {
+            self.dotprod
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn detect() -> Self {
         Self {
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]

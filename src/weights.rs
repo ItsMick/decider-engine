@@ -420,6 +420,50 @@ impl Linear {
         out
     }
     pub fn apply_into(&self, x: &[f32], out: &mut [f32], epilogue: Epilogue) {
+        // Keep the measured scalar INT8 fallback's separate execution plan.
+        // Native ARM dot products and FP32 modes use the fused output path.
+        if matches!(
+            self.w,
+            Data::Quantized {
+                compute_int8: true,
+                ..
+            }
+        ) && !crate::int8::Kernel::detect().accelerated()
+        {
+            let direct = matches!(epilogue, Epilogue::Write);
+            let mut temporary = Vec::new();
+            let values = if direct {
+                &mut *out
+            } else {
+                temporary.resize(out.len(), 0.0);
+                &mut temporary
+            };
+            let rows = x.len() / self.input;
+            linear(
+                x,
+                rows,
+                self.input,
+                &self.w,
+                self.output,
+                self.bias.as_deref(),
+                values,
+            );
+            if let Some((a, b, rank, scale)) = &self.lora {
+                let mut mid = vec![0.0; rows * rank];
+                linear(x, rows, self.input, a, *rank, None, &mut mid);
+                let mut delta = vec![0.0; values.len()];
+                linear(&mid, rows, *rank, b, self.output, None, &mut delta);
+                for (value, delta) in values.iter_mut().zip(delta) {
+                    *value += scale * delta;
+                }
+            }
+            if !direct {
+                for (dst, value) in out.iter_mut().zip(temporary) {
+                    epilogue.store(dst, value);
+                }
+            }
+            return;
+        }
         let rows = x.len() / self.input;
         let mut mid = Vec::new();
         let adapter = if let Some((a, b, rank, scale)) = &self.lora {

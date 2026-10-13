@@ -32,7 +32,7 @@ pub(crate) enum Epilogue {
     SwiGlu,
 }
 impl Epilogue {
-    fn store(self, dst: &mut f32, value: f32) {
+    pub(crate) fn store(self, dst: &mut f32, value: f32) {
         match self {
             Self::Write => *dst = value,
             Self::Add => *dst += value,
