@@ -2,6 +2,7 @@
 //! FP32 arithmetic matches the upstream CPU serving path. No generation or KV cache.
 use crate::tensor::{dot_scores, softmax};
 use crate::weights::{Data, Linear, Weights};
+use rayon::prelude::*;
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -116,25 +117,18 @@ pub(crate) fn rms(x: &mut [f32], w: &[f32], eps: f32, centered: bool) {
         }
     }
 }
-fn normalized(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let mut y = x.to_vec();
-    rms(&mut y, w, eps, true);
-    y
-}
 fn add(x: &mut [f32], y: &[f32]) {
     for (a, b) in x.iter_mut().zip(y) {
         *a += b;
     }
 }
-fn rotary(x: &mut [f32], pos: usize, c: &Config) {
-    let r = c.rotary_dim();
-    for i in 0..r / 2 {
-        let angle = pos as f32 / c.rope_parameters.rope_theta.powf((2 * i) as f32 / r as f32);
-        let (sin, cos) = angle.sin_cos();
+fn rotary(x: &mut [f32], angles: &[(f32, f32)]) {
+    let half = angles.len();
+    for (i, &(sin, cos)) in angles.iter().enumerate() {
         let a = x[i];
-        let b = x[i + r / 2];
+        let b = x[i + half];
         x[i] = a * cos - b * sin;
-        x[i + r / 2] = b * cos + a * sin;
+        x[i + half] = b * cos + a * sin;
     }
 }
 
@@ -154,7 +148,7 @@ struct Delta {
     out: Linear,
     conv: Vec<f32>,
     dt: Vec<f32>,
-    a_log: Vec<f32>,
+    decay_rate: Vec<f32>,
     norm: Vec<f32>,
 }
 enum Mixer {
@@ -174,6 +168,7 @@ pub(crate) struct Model {
     embedding: Data,
     layers: Vec<Layer>,
     norm: Vec<f32>,
+    rotary_divisors: Vec<f32>,
 }
 
 impl Model {
@@ -225,10 +220,14 @@ impl Model {
                         &format!("{p}.linear_attn.dt_bias"),
                         &[c.linear_num_value_heads],
                     )?,
-                    a_log: w.take(
-                        &format!("{p}.linear_attn.A_log"),
-                        &[c.linear_num_value_heads],
-                    )?,
+                    decay_rate: w
+                        .take(
+                            &format!("{p}.linear_attn.A_log"),
+                            &[c.linear_num_value_heads],
+                        )?
+                        .into_iter()
+                        .map(|v| -v.exp())
+                        .collect(),
                     norm: w.take(
                         &format!("{p}.linear_attn.norm.weight"),
                         &[c.linear_value_head_dim],
@@ -268,11 +267,20 @@ impl Model {
                 w.remaining()
             ));
         }
+        let r = c.rotary_dim();
+        let rotary_divisors = if c.layer_types.iter().any(|s| s == "full_attention") {
+            (0..r / 2)
+                .map(|i| c.rope_parameters.rope_theta.powf((2 * i) as f32 / r as f32))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             config: c,
             embedding,
             layers,
             norm,
+            rotary_divisors,
         })
     }
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
@@ -289,14 +297,26 @@ impl Model {
             let offset = *id as usize * c.hidden_size;
             x.extend_from_slice(self.embedding.row(offset, c.hidden_size, &mut scratch));
         }
+        // Position-dependent values are shared by all heads and full-attention
+        // layers in this forward pass; no request state is cached on the model.
+        let angles: Vec<_> = (0..ids.len())
+            .flat_map(|pos| {
+                self.rotary_divisors
+                    .iter()
+                    .map(move |divisor| (pos as f32 / divisor).sin_cos())
+            })
+            .collect();
+        let mut n = vec![0.0; x.len()];
         for layer in &self.layers {
-            let n = normalized(&x, &layer.input_norm, c.rms_norm_eps);
+            n.copy_from_slice(&x);
+            rms(&mut n, &layer.input_norm, c.rms_norm_eps, true);
             let mixed = match &layer.mixer {
-                Mixer::Full(m) => m.forward(&n, c),
+                Mixer::Full(m) => m.forward(&n, c, &angles),
                 Mixer::Delta(m) => m.forward(&n, c),
             };
             add(&mut x, &mixed);
-            let n = normalized(&x, &layer.post_norm, c.rms_norm_eps);
+            n.copy_from_slice(&x);
+            rms(&mut n, &layer.post_norm, c.rms_norm_eps, true);
             let mut gate = layer.gate.apply(&n);
             let up = layer.up.apply(&n);
             for (g, u) in gate.iter_mut().zip(up) {
@@ -313,7 +333,7 @@ impl Model {
 }
 
 impl Full {
-    fn forward(&self, x: &[f32], c: &Config) -> Vec<f32> {
+    fn forward(&self, x: &[f32], c: &Config, angles: &[(f32, f32)]) -> Vec<f32> {
         let n = x.len() / c.hidden_size;
         let d = c.head_dim;
         let qw = c.num_attention_heads * d;
@@ -333,40 +353,76 @@ impl Full {
         let v = self.v.apply(x);
         rms(&mut q, &self.q_norm, c.rms_norm_eps, true);
         rms(&mut k, &self.k_norm, c.rms_norm_eps, true);
+        let half = c.rotary_dim() / 2;
         for t in 0..n {
+            let angles = &angles[t * half..(t + 1) * half];
             for h in 0..c.num_attention_heads {
-                rotary(&mut q[t * qw + h * d..t * qw + (h + 1) * d], t, c);
+                rotary(&mut q[t * qw + h * d..t * qw + (h + 1) * d], angles);
             }
             for h in 0..c.num_key_value_heads {
-                rotary(&mut k[t * kw + h * d..t * kw + (h + 1) * d], t, c);
+                rotary(&mut k[t * kw + h * d..t * kw + (h + 1) * d], angles);
             }
         }
-        let mut out = vec![0.0; n * qw];
-        let scale = (d as f32).sqrt().recip();
-        for t in 0..n {
-            for h in 0..c.num_attention_heads {
-                let kh = h / (c.num_attention_heads / c.num_key_value_heads);
-                let query = &q[t * qw + h * d..t * qw + (h + 1) * d];
-                let mut scores: Vec<f32> = (0..=t)
-                    .map(|s| dot_scores(query, &k[s * kw + kh * d..s * kw + (kh + 1) * d]) * scale)
-                    .collect();
-                softmax(&mut scores);
-                let dst = &mut out[t * qw + h * d..t * qw + (h + 1) * d];
-                for (s, p) in scores.iter().enumerate() {
-                    for (o, a) in dst
-                        .iter_mut()
-                        .zip(&v[s * kw + kh * d..s * kw + (kh + 1) * d])
-                    {
-                        *o += p * a;
-                    }
-                }
-            }
-        }
+        let mut out = causal_attention(&q, &k, &v, c.num_attention_heads, c.num_key_value_heads, d);
         for (o, g) in out.iter_mut().zip(gate) {
             *o *= sigmoid(g);
         }
         self.o.apply(&out)
     }
+}
+
+fn causal_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    heads: usize,
+    key_heads: usize,
+    d: usize,
+) -> Vec<f32> {
+    let qw = heads * d;
+    let kw = key_heads * d;
+    let n = q.len() / qw;
+    assert_eq!(q.len(), n * qw);
+    assert_eq!(k.len(), n * kw);
+    assert_eq!(v.len(), k.len());
+    let mut out = vec![0.0; n * qw];
+    let scale = (d as f32).sqrt().recip();
+    // Each token's causal attention reads immutable Q/K/V and writes a
+    // disjoint output row. Score buffers belong to the sequential loop or
+    // a Rayon job rather than being allocated once per token and head.
+    let compute = |t: usize, token_out: &mut [f32], scores: &mut Vec<f32>| {
+        for h in 0..heads {
+            let kh = h / (heads / key_heads);
+            let query = &q[t * qw + h * d..t * qw + (h + 1) * d];
+            scores.clear();
+            scores
+                .extend((0..=t).map(|s| {
+                    dot_scores(query, &k[s * kw + kh * d..s * kw + (kh + 1) * d]) * scale
+                }));
+            softmax(scores);
+            let dst = &mut token_out[h * d..(h + 1) * d];
+            for (s, p) in scores.iter().enumerate() {
+                for (o, a) in dst
+                    .iter_mut()
+                    .zip(&v[s * kw + kh * d..s * kw + (kh + 1) * d])
+                {
+                    *o += p * a;
+                }
+            }
+        }
+    };
+    if n >= 32 && qw >= 128 && rayon::current_num_threads() > 1 {
+        out.par_chunks_mut(qw).enumerate().for_each_init(
+            || Vec::with_capacity(n),
+            |scores, (t, row)| compute(t, row, scores),
+        );
+    } else {
+        let mut scores = Vec::with_capacity(n);
+        for (t, row) in out.chunks_exact_mut(qw).enumerate() {
+            compute(t, row, &mut scores);
+        }
+    }
+    out
 }
 
 impl Delta {
@@ -414,7 +470,7 @@ impl Delta {
                 for v in &mut k {
                     *v *= knorm;
                 }
-                let decay = (-self.a_log[head].exp()
+                let decay = (self.decay_rate[head]
                     * softplus(a[t * c.linear_num_value_heads + head] + self.dt[head]))
                 .exp();
                 let beta = sigmoid(b[t * c.linear_num_value_heads + head]);
@@ -450,5 +506,49 @@ impl Delta {
             }
         }
         self.out.apply(&out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_attention_matches_serial_and_preserves_causal_isolation() {
+        let (heads, key_heads, d) = (2, 1, 64);
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        // Include the dispatch boundary and a partial final group of tokens.
+        for n in [31, 32, 35] {
+            let q: Vec<f32> = (0..n * heads * d)
+                .map(|i| ((i * 71 % 113) as f32 - 56.0) / 47.0)
+                .collect();
+            let mut k: Vec<f32> = (0..n * key_heads * d)
+                .map(|i| ((i * 43 % 97) as f32 - 48.0) / 39.0)
+                .collect();
+            let mut v: Vec<f32> = (0..k.len())
+                .map(|i| ((i * 13 % 89) as f32 - 44.0) / 33.0)
+                .collect();
+            let expected = serial.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
+            let actual = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
+            assert_eq!(actual, expected);
+            k[(n - 3) * key_heads * d..].fill(7.0);
+            v[(n - 3) * key_heads * d..].fill(-11.0);
+            let changed = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
+            assert_eq!(
+                &actual[..(n - 3) * heads * d],
+                &changed[..(n - 3) * heads * d]
+            );
+            assert_ne!(
+                &actual[(n - 3) * heads * d..],
+                &changed[(n - 3) * heads * d..]
+            );
+        }
     }
 }

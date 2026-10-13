@@ -69,7 +69,7 @@ println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 For a Git dependency:
 
 ```toml
-decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.0" }
+decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.1" }
 ```
 
 ## Scope and checks
@@ -94,6 +94,11 @@ full-weight test compares three questions against the pinned v21 reference;
 this is a parity check, not a benchmark of decision quality.
 See [fixture provenance](tests/fixtures/README.md).
 Rayon controls parallelism through its standard `RAYON_NUM_THREADS` setting.
+The forward pass precomputes RoPE frequencies and constant decay rates at load,
+shares rotary sine/cosine values across heads and layers within each request,
+and reuses normalization and attention-score buffers. Large causal attention
+passes parallelize independent token rows; short passes remain sequential.
+These changes preserve reduction order and do not change quantization settings.
 
 ## Lower precision and ARM64 Lambda
 

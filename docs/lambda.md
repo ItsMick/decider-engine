@@ -29,6 +29,15 @@ FP32 `mul_add` enables native fused multiply-add on AArch64; numerical results c
 differ in their last digits. CI exercises the Neoverse N1 target on Linux ARM64
 and the portable target on Apple ARM64, with synthetic parity fixtures.
 
+The FP32 dot loop already compiles to NEON fused multiply-add instructions with
+this target. Additional forward-pass optimizations reuse position-dependent
+RoPE sine/cosine values across heads and layers, cache constant decay rates at
+load, and reuse normalization and attention-score buffers. Causal attention
+parallelizes independent token rows for at least 32 tokens and a query width of
+at least 128, when the Rayon pool has multiple workers. The order of sums within
+each token is preserved. Scratch memory belongs to the forward pass or Rayon
+job; no request state or answer is cached on the model.
+
 `--precision int8-compute` / `Precision::Int8Compute` enables dynamic INT8
 projection inputs and INT32 dot products for base projections. Graviton2 supports
 NEON `SDOT` and the engine detects it at runtime. The existing `int8` mode is
