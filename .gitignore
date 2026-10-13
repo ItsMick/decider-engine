@@ -1,0 +1,9 @@
+/target/
+/models/
+*.part
+.env
+.env.*
+*.safetensors
+!tests/fixtures/tiny/base/model.safetensors
+!tests/fixtures/tiny/head.safetensors
+!tests/fixtures/tiny/lora/adapter_model.safetensors

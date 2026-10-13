@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "[UNK]": 0,
+      "<": 1,
+      ">": 2,
+      "state": 3,
+      "question": 4,
+      "options": 5,
+      "answer": 6,
+      "true": 7,
+      "false": 8,
+      "1": 9,
+      "2": 10,
+      "3": 11,
+      "billing": 12,
+      "technical": 13,
+      "score": 14,
+      "choice": 15,
+      "noul": 16,
+      "yes": 17,
+      "no": 18,
+      "good": 19
+    },
+    "unk_token": "[UNK]"
+  }
+}

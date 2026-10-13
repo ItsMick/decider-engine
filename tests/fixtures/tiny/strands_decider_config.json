@@ -1,0 +1,1 @@
+{"base_model": "Qwen/Qwen3.5-2B-Base", "head_type": "pointer", "pointer_dim": 4, "max_length": 256, "temperature": 0.9, "temperature_by_kind": {"choice": 0.7, "noul": 0.8, "score": 1.2}, "ordinal_smoothing": 0.1, "use_lora": true}

@@ -1,0 +1,20 @@
+{
+  "state": "My payouts have been failing for three days. Café 東京.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": { "billing": "payments, invoices, payouts", "technical": "bugs, outages, API errors", "sales": "pricing and upgrades" }
+    },
+    "urgent": {
+      "type": "noul",
+      "instructions": "The customer reports a problem that needs help.",
+      "criteria": { "true": "A service issue is reported", "false": "No issue is reported" }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is this situation?",
+      "criteria": ["No problem", "Minor issue", "Service blocked"]
+    }
+  }
+}
