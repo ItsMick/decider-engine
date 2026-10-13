@@ -514,6 +514,49 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "synthetic attention timing; run with --release"]
+    fn benchmark_causal_attention() {
+        use std::{hint::black_box, time::Instant};
+        let (heads, key_heads, d) = (8, 2, 256);
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        for n in [32, 128, 512] {
+            let q: Vec<f32> = (0..n * heads * d)
+                .map(|i| ((i * 71 % 113) as f32 - 56.0) / 47.0)
+                .collect();
+            let k: Vec<f32> = (0..n * key_heads * d)
+                .map(|i| ((i * 43 % 97) as f32 - 48.0) / 39.0)
+                .collect();
+            let v: Vec<f32> = (0..k.len())
+                .map(|i| ((i * 13 % 89) as f32 - 44.0) / 33.0)
+                .collect();
+            for pool in &pools {
+                pool.install(|| {
+                    black_box(causal_attention(&q, &k, &v, heads, key_heads, d));
+                });
+                let start = Instant::now();
+                for _ in 0..3 {
+                    pool.install(|| {
+                        black_box(causal_attention(black_box(&q), &k, &v, heads, key_heads, d));
+                    });
+                }
+                println!(
+                    "attention tokens={n} workers={} mean_ms={:.3}",
+                    pool.current_num_threads(),
+                    start.elapsed().as_secs_f64() * 1000.0 / 3.0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parallel_attention_matches_serial_and_preserves_causal_isolation() {
         let (heads, key_heads, d) = (2, 1, 64);
         let serial = rayon::ThreadPoolBuilder::new()
