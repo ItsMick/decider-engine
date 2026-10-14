@@ -1,4 +1,6 @@
 /target/
+/lambda/target/
+/lambda/results/
 /models/
 __pycache__/
 *.part

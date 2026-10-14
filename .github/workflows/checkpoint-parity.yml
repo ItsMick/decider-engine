@@ -1,6 +1,11 @@
 name: Pinned checkpoint parity
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/fixtures/v21*reference.json'
+      - 'scripts/generate-reference.py'
+      - '.github/workflows/checkpoint-parity.yml'
   push:
     tags: ['v*']
 permissions:
@@ -13,7 +18,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       RAYON_NUM_THREADS: '4'
       DECIDER_TEST_MODEL_DIR: models/v21
@@ -35,7 +40,7 @@ jobs:
             cargo -V
             git rev-parse HEAD
             cat models/v21/revisions.json
-            sha256sum tests/fixtures/v21-reference.json
+            sha256sum tests/fixtures/v21*reference.json scripts/generate-reference.py
             echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
           } > validation/environment.txt
       - name: Required checkpoint-precision reference parity
@@ -50,3 +55,38 @@ jobs:
           name: v21-parity-${{ matrix.os }}
           path: validation/
           retention-days: 30
+
+  publish:
+    name: Publish validated tag
+    needs: parity
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.0'
+      - name: Check package version matches tag
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as f:
+              version = tomllib.load(f)['package']['version']
+          assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'tag/package version mismatch'
+          PY
+      - name: Verify and package source
+        run: cargo package --locked
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: v21-parity-*
+          path: validation
+      - name: Publish only after both architecture gates pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf checkpoint-parity-evidence.tar.gz validation
+          sha256sum target/package/*.crate checkpoint-parity-evidence.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            target/package/*.crate checkpoint-parity-evidence.tar.gz SHA256SUMS

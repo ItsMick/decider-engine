@@ -46,3 +46,26 @@ jobs:
         env:
           RAYON_NUM_THREADS: '4'
         run: cargo test --release --locked --lib benchmark_fused_projection -- --ignored --nocapture
+  lambda-host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lambda
+      - run: cargo fmt --manifest-path lambda/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path lambda/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path lambda/Cargo.toml
+      - run: cargo build --locked --manifest-path lambda/Cargo.toml
+      - name: Runtime API integration with synthetic weights
+        env:
+          DECIDER_LAMBDA_BIN: lambda/target/debug/decider-lambda
+        run: python3 -m unittest discover -s scripts -p 'test_lambda_runtime.py'

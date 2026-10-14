@@ -5,7 +5,8 @@
 The `Pinned checkpoint parity` workflow runs explicitly through `workflow_dispatch`
 or on `v*` tags. It downloads the pinned v21 checkpoint with the existing checksum
 verifier, then runs checkpoint-precision reference parity on x86_64 and ARM64.
-Normal PRs continue to use the small synthetic fixtures. Logs and machine,
+Normal PRs continue to use the small synthetic fixtures; changes to the oracle
+or this workflow also trigger the full matrix. Logs and machine,
 toolchain, source, model revisions and fixture hashes are retained as artifacts;
 model weights are never uploaded.
 
@@ -17,18 +18,26 @@ RAYON_NUM_THREADS=4 DECIDER_TEST_MODEL_DIR=models/v21 \
   cargo test --release --locked --test model -- --ignored --nocapture
 ```
 
-The existing reference includes three questions, one per kind. Exact token IDs,
-option/answer positions, answer domains, token usage and choice are checked;
-absolute logit tolerance is `1e-4`, probability/confidence/score tolerance `1e-5`.
-Quantized modes do not participate in this reference parity claim.
+The original and independently generated expanded references cover all three
+question kinds, one and three questions, reversed options, an empty state,
+Unicode, and exact 1,024/4,096-token contexts. A 4,097-token variant is rejected.
+Exact token IDs, option/answer positions, answer domains, token usage and choice
+are checked; absolute logit tolerance is `1e-4`, probability/confidence/score
+tolerance `1e-5`. These tolerances are unchanged from the original reference.
+Quantized modes do not participate in checkpoint parity.
 
-Release procedure: require both architecture jobs to succeed for the exact tag
-commit before publishing or describing that release as validated. The workflow
-does **not** publish releases or prevent someone with repository permission from
-manually publishing. Automated release publication depending on these jobs, and
-an independently generated expanded reference matrix (long/near-4096 contexts,
-option permutations and question counts), are still outstanding under #2. A
-green three-question job does not satisfy those missing acceptance criteria.
+The workflow's `publish` job depends on the complete x86_64/ARM64 matrix. On a
+version tag it checks that Cargo's version matches, verifies the source package,
+and creates a GitHub release with parity evidence and checksums. A failure on
+either architecture prevents that automated release. Manual runs validate without
+publishing. No crates.io publishing is configured. Repository administrators can
+still publish outside this workflow; access policy is outside this change.
+
+Cadence: normal PRs run synthetic tests and the Lambda Runtime API integration.
+Run the full matrix manually for changes to kernels, rendering, binding, loading,
+or readout; every release tag runs it obligatorily before automated publication.
+See [fixture provenance and regeneration](../tests/fixtures/README.md) for the
+pinned Python oracle. Expected outputs must never be regenerated from Rust.
 
 ## Adversarial and precision smoke evaluation
 
@@ -95,11 +104,70 @@ improves robustness. Any future encoding/template experiment needs its own
 reference and semantic evaluation before adoption. Downstream systems must retain
 their own authorization rules and workload-specific escalation policy.
 
-## Hardware work still pending
+## Versioned quality regression gates
 
-Issues #6 and #7 require full-model measurements on the intended ARM/Lambda host.
-This change does not introduce an unmeasured GEMM rewrite, deploy AWS resources,
-or claim a Graviton speedup. The evaluation executable reuses one engine across
-requests and records load time separately, so it can assist later experiments.
-It does not replace a Lambda host, cold/warm sampling harness, operator/allocation
-profiling, cost measurement, or real SDOT dispatch verification on deployment.
+New `evaluate` reports include exact suite SHA256, model revisions, and the
+checkpoint configuration SHA256 (including temperatures). The summarizer rejects
+duplicate cases, missing/extra answers, changed domains, invalid distributions,
+and inconsistent categorical choices. `expected_answers` supports per-question
+labels. Historical smoke reports remain readable, but cannot pass the new gate
+without the required identity metadata.
+
+`scripts/check-quality-gates.py POLICY SUITE REPORT...` applies an explicit frozen
+policy, with separate limits for every precision including checkpoint. It exits
+0 for passing limits, 1 for measured failures, and 2 for invalid/mismatched
+inputs. It checks corpus identity, checkpoint/configuration identity, minimum
+labeled decision count, flips, probability/score drift, Brier, NLL, ECE, semantic
+failures and optional aggregate threshold crossings. The aggregate sums crossings
+at 0.8, 0.9 and 0.95, so one decision can contribute more than one crossing.
+
+Example policy structure (fill in the identity fields, choose limits from your
+requirements, and freeze it **before** collecting candidate results):
+
+```json
+{
+  "version": 1,
+  "status": "template",
+  "id": "workload-v1-checkpoint-calibration-v1",
+  "suite_sha256": "REPLACE",
+  "model_revisions": {"decider": "REPLACE", "base": "REPLACE"},
+  "config_sha256_by_mode": {
+    "checkpoint": "REPLACE", "int8": "REPLACE",
+    "int8-compute": "REPLACE", "int4": "REPLACE"
+  },
+  "minimum_labeled_decisions": 1000,
+  "modes": {
+    "checkpoint": {"semantic_failures": 0},
+    "int8": {"answer_flips_vs_checkpoint": 0, "max_absolute_probability_drift": 0.01},
+    "int8-compute": {"answer_flips_vs_checkpoint": 0, "max_absolute_probability_drift": 0.01},
+    "int4": {"answer_flips_vs_checkpoint": 0, "max_absolute_probability_drift": 0.01}
+  }
+}
+```
+
+Those numbers illustrate the format; they are **not** established production
+acceptance limits. A template is rejected until explicitly frozen. Store the
+policy with the workload and calibration split identifiers in version control.
+Each precision is a distinct candidate even when it retains the same checkpoint
+temperatures. Separately fitted calibration configurations require a new policy
+and evaluation, not reuse of an old pass. No public smoke corpus or software gate
+establishes deployment representativeness, absence of leakage, or an acceptable
+false-accept/false-reject tradeoff. #3 remains open for that empirical work.
+
+## Hardware evidence
+
+The [Lambda host and experiment guide](../lambda/README.md) now provide a resident
+Runtime API service, ARM64 container recipe, private disposable stack, and
+cold/warm benchmark runner. Local tests exercise real Runtime API requests with
+synthetic weights, including rejection before deserialization and engine reuse.
+They do not establish container deployment success or actual Lambda performance.
+#7 still requires the real AWS experiment and a committed measured report.
+
+#6 requires an operator/allocation/cache profile on the intended ARM host before
+choosing a projection-buffer rewrite. No unmeasured GEMM rewrite is included.
+Capture CPU/toolchain/compiler flags, warm full-model inputs, precision and
+worker count; use native sampling/allocation tooling on a matching Graviton2
+host when Lambda does not expose those counters. Keep profile instrumentation
+out of the production timing runs. An operator gain must survive an alternating
+full-model baseline/candidate comparison at short and long prompts in every
+precision, including scalar fallback, before replacing a projection path.

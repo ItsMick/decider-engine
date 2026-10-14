@@ -1,6 +1,7 @@
 //! Bounded, opt-in semantic/precision smoke evaluation; never downloads weights.
 use decider_engine::{DecisionEngine, NativeEngine, Precision, Request};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path, time::Instant};
 
 fn run() -> Result<(), String> {
@@ -26,6 +27,15 @@ fn run() -> Result<(), String> {
     if bytes.len() > 8 * 1024 * 1024 {
         return Err("evaluation suite exceeds 8 MiB".into());
     }
+    let suite_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let model_dir = Path::new(&args[0]);
+    let revisions: Value = serde_json::from_slice(
+        &std::fs::read(model_dir.join("revisions.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let config =
+        std::fs::read(model_dir.join("strands_decider_config.json")).map_err(|e| e.to_string())?;
+    let config_sha256 = format!("{:x}", Sha256::digest(&config));
     let suite: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let cases = suite["cases"].as_array().ok_or("suite needs cases")?;
     if cases.is_empty() || cases.len() > 256 {
@@ -58,7 +68,8 @@ fn run() -> Result<(), String> {
         results.push(json!({"id":case["id"], "bindings":bindings, "elapsed_ms":start.elapsed().as_secs_f64()*1000.0, "response":response}));
     }
     println!("{}", serde_json::to_string_pretty(&json!({
-        "suite_version":suite["version"], "precision":args[2], "architecture":std::env::consts::ARCH,
+        "suite_version":suite["version"], "suite_sha256":suite_sha256,
+        "model_revisions":revisions, "config_sha256":config_sha256, "precision":args[2], "architecture":std::env::consts::ARCH,
         "rayon_workers":rayon::current_num_threads(), "load_ms":load_ms, "cases":results,
         "warning":"Smoke evaluation only; timings are single samples, not latency quantiles or Lambda measurements."
     })).map_err(|e| e.to_string())?);
