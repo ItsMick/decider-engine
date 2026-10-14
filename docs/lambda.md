@@ -1,11 +1,11 @@
 # ARM64 Lambda
 
-This library can be embedded in a Rust Lambda handler. The bundled CLI uses
-stdin/stdout; it is not a Lambda Runtime API client. Use the official
-[`lambda_runtime`](https://github.com/aws/aws-lambda-rust-runtime) crate for the
-host and create one `NativeEngine` before its event loop. Keep that engine alive
-for warm invocations. Run synchronous inference using `spawn_blocking` if the
-host uses Tokio; do not block its async worker with a forward pass.
+The opt-in [`lambda/` host](../lambda/README.md) uses the official Rust Runtime
+API client, loads one engine per environment, serializes blocking inference, and
+applies `InferenceLimits::lambda()`. It includes a private CloudFormation stack,
+ARM64 container recipe and a cold/warm benchmark runner. The CLI remains a
+stdin/stdout executable. Neither the host nor its benchmark has been deployed to
+AWS by this project; local Runtime API tests use synthetic weights.
 
 ## Build and package
 
@@ -81,7 +81,7 @@ per invocation. Set Rayon worker count to the CPU allocation; avoid extra
 parallel requests inside one execution environment until measured.
 
 Bound request bytes, question count, and total tokens in the host. A useful
-initial experiment is 1–4 questions with at most 512 tokens per bound prompt;
+initial experiment is 1–3 questions with at most 512 tokens per bound prompt;
 use `engine.encode` to check the token count before forwarding. This is a
 starting point, not the model's context limit. Increase it after measuring.
 Activation memory and duration grow with the prompt length. Questions currently

@@ -19,10 +19,14 @@ def distribution(answer):
 
 def summarize(suite, reports):
     cases = {case["id"]: case for case in suite["cases"]}
+    if not cases or len(cases) != len(suite["cases"]):
+        raise ValueError("suite requires unique nonempty cases/version")
     modes = {report["precision"]: {c["id"]: c for c in report["cases"]} for report in reports}
     if len(modes) != len(reports) or "checkpoint" not in modes:
         raise ValueError("provide one checkpoint report and at most one report per other mode")
     for report in reports:
+        if len(report["cases"]) != len(modes[report["precision"]]):
+            raise ValueError("duplicate report case")
         if report["suite_version"] != suite["version"] or set(modes[report["precision"]]) != set(cases):
             raise ValueError("report cases/version do not match suite")
     reference = modes["checkpoint"]
@@ -33,14 +37,18 @@ def summarize(suite, reports):
         for id, row in rows.items():
             if row["bindings"] != reference[id]["bindings"]:
                 raise ValueError(f"{mode}/{id}: token binding changed")
-            for name, answer in row["response"]["answers"].items():
+            answers = row["response"]["answers"]
+            expected_names = cases[id].get("request", {}).get("questions", reference[id]["response"]["answers"]).keys()
+            if not answers or answers.keys() != expected_names or answers.keys() != reference[id]["response"]["answers"].keys():
+                raise ValueError(f"{mode}/{id}: missing or extra answers")
+            for name, answer in answers.items():
                 baseline = reference[id]["response"]["answers"][name]
                 p, b = distribution(answer), distribution(baseline)
-                if p.keys() != b.keys() or answer["type"] != baseline["type"]:
+                if not p or p.keys() != b.keys() or answer["type"] != baseline["type"]:
                     raise ValueError(f"{mode}/{id}/{name}: answer domain changed")
-                if not all(math.isfinite(v) and 0 <= v <= 1 for v in p.values()):
+                if not all(math.isfinite(v) and 0 <= v <= 1 for v in [*p.values(), *b.values()]):
                     raise ValueError("invalid probabilities")
-                if abs(sum(p.values()) - 1) > 1e-5:
+                if abs(sum(p.values()) - 1) > 1e-5 or abs(sum(b.values()) - 1) > 1e-5:
                     raise ValueError("probabilities do not sum to one")
                 for key in p:
                     delta = abs(p[key] - b[key])
@@ -50,20 +58,30 @@ def summarize(suite, reports):
                 # comparisons use expected-value drift, not rounded categories.
                 if answer["type"] == "choice":
                     winner, base_winner = answer["choice"], baseline["choice"]
+                    if winner not in p or base_winner not in b or p[winner] != max(p.values()) or b[base_winner] != max(b.values()):
+                        raise ValueError("choice does not match its probabilities")
                 elif answer["type"] == "noul":
                     winner = "true" if answer["noul"] > 0.5 else "false"
                     base_winner = "true" if baseline["noul"] > 0.5 else "false"
-                else:
+                elif answer["type"] == "score":
+                    if not math.isfinite(answer["score"]) or not math.isfinite(baseline["score"]):
+                        raise ValueError("invalid score")
                     scores.append(abs(answer["score"] - baseline["score"]))
                     continue
+                else:
+                    raise ValueError("unknown answer type")
                 if winner != base_winner:
                     flips.append(id + "/" + name)
                 for threshold in crossings:
                     if (max(p.values()) >= float(threshold)) != (max(b.values()) >= float(threshold)):
                         crossings[threshold] += 1
-                expected = cases[id].get("expected")
+                expected = cases[id].get("expected_answers", {}).get(name, cases[id].get("expected"))
+                if "expected" in cases[id] and len(answers) != 1:
+                    raise ValueError("multi-question labels require expected_answers")
                 if expected is not None:
                     expected = str(expected).lower() if isinstance(expected, bool) else expected
+                    if expected not in p:
+                        raise ValueError("label outside answer domain")
                     correct = winner == expected
                     confidence = p[winner]
                     labeled.append((confidence, correct, sum((v - (k == expected)) ** 2 for k, v in p.items()), -math.log(max(p[expected], 1e-12))))

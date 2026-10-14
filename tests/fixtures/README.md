@@ -31,3 +31,36 @@ SHA256 of the upstream Strands source files used by the reference generator:
 5ac5b772795dfa5790504b4956d73abdcd09862cd0603dcda4a1df660808faec  prompting.py
 a4b0e9081064f3be9e15fced49328ca78c3acc9a86183b3bd77fd282684748a8  schema.py
 ```
+
+## Expanded v21 oracle (version 2)
+
+`v21-expanded-reference.json` adds reversed choice options, an empty-state short
+noul question, a 1,024-token context, and the exact 4,096-token boundary. The
+original three-question request covers all kinds and shared-state question
+ordering. The Rust release test also rejects the same boundary request with one
+extra token, and retains the original reference checks. This is a deterministic
+numerical conformance corpus, not held-out decision-quality data.
+
+The generator is now checked in. It uses unmodified Transformers decoder layers,
+FP32 arithmetic, eager causal attention, and separate LoRA projections. It loads
+one layer at a time to keep memory bounded and uses the upstream Strands pointer
+head and unrounded readout formulas. It does not call the Rust engine. Upstream
+source hashes, package versions, model revisions and the exact prompts are in
+the fixture. The original fixture's logits reproduced within `6e-7` locally.
+
+```sh
+python3 -m venv reference-venv
+reference-venv/bin/pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+reference-venv/bin/pip install -r scripts/reference-requirements.txt
+git clone https://github.com/strands-labs/strands-decider.git strands-reference
+git -C strands-reference checkout 8b6faa553038a59e73fa7f16c4081f8ceb21d27e
+python3 scripts/download-model.py models/v21
+reference-venv/bin/python scripts/generate-reference.py models/v21 strands-reference \
+  tests/fixtures/v21-expanded-reference.json
+```
+
+Fixture regeneration is deliberate and reviewed, never part of the Rust parity
+job. The generator rejects changed source hashes, revisions or core package
+versions. Run on CPU with about 8 GiB available memory; generation and the native
+4,096-token forward can take minutes. The independent Python dependencies do not
+enter the engine, its release package, or normal CI.

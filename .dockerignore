@@ -1,0 +1,7 @@
+.git
+**/target
+**/__pycache__
+**/*.part
+models/v21/.pull.lock
+lambda/results
+**/*.corrupt-*

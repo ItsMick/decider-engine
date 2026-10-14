@@ -1,0 +1,9 @@
+# First install torch==2.14.0 from https://download.pytorch.org/whl/cpu.
+# This generator intentionally requires a CPU wheel, not a GPU dependency stack.
+transformers==5.16.1
+peft==0.21.0
+accelerate==1.13.0
+tokenizers==0.23.3
+safetensors==0.8.0
+numpy==2.5.4
+pydantic==2.14.1

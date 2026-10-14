@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Private, disposable Decider Graviton benchmark; no public endpoint
+Parameters:
+  ImageUri:
+    Type: String
+    AllowedPattern: '.+\.dkr\.ecr\..+\.amazonaws\.com/.+@sha256:[a-f0-9]{64}'
+    Description: ARM64 ECR image pinned by digest, containing verified v21 model and licenses
+  Memory:
+    Type: Number
+    Default: 10240
+    AllowedValues: [6144, 8192, 10240]
+  Workers:
+    Type: String
+    Default: '4'
+    AllowedValues: ['1', '2', '3', '4', '5', '6']
+  Precision:
+    Type: String
+    Default: checkpoint
+    AllowedValues: [checkpoint, int8, int8-compute]
+  RunNonce:
+    Type: String
+    Default: initial
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      PackageType: Image
+      Architectures: [arm64]
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: !GetAtt Role.Arn
+      MemorySize: !Ref Memory
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          DECIDER_PRECISION: !Ref Precision
+          RAYON_NUM_THREADS: !Ref Workers
+          DECIDER_MODEL_DIR: /opt/model
+          DECIDER_REQUIRE_SDOT: '1'
+          DECIDER_BENCHMARK_NONCE: !Ref RunNonce
+      Tags:
+        - Key: decider-purpose
+          Value: disposable-benchmark
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Function}
+      RetentionInDays: 1
+Outputs:
+  FunctionName:
+    Value: !Ref Function

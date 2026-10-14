@@ -198,7 +198,10 @@ intrinsic, which requires Rust 1.98. There is no handwritten assembly. Each dot
 product is limited to 64 bytes, preventing INT32 overflow even for -128 inputs. ARM CI
 requires dot-product support and compares the accelerated and scalar results.
 
-See [ARM64 Lambda notes](docs/lambda.md) for build targets, sizing, and limitations.
+See the [opt-in Lambda host and benchmark](lambda/README.md) and
+[ARM64 notes](docs/lambda.md) for deployment, sizing, and limitations.
+[Validation](docs/validation.md) describes the independent full-checkpoint release
+gate and versioned quality regression checks.
 
 ## License
 

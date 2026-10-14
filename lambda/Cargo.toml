@@ -1,0 +1,18 @@
+[package]
+name = "decider-lambda"
+version = "0.1.0"
+edition = "2021"
+publish = false
+rust-version = "1.98"
+
+# Independent lockfile: Lambda dependencies do not enter the library's runtime.
+[workspace]
+
+[dependencies]
+decider-engine = { path = ".." }
+lambda_runtime = "=1.4.0"
+rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
