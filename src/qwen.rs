@@ -654,30 +654,11 @@ impl Delta {
         let z = self.z.apply(x);
         let a = self.a.apply(x);
         let b = self.b.apply(x);
-        let mut conv = vec![0.0; raw.len()];
         let kernel = c.linear_conv_kernel_dim;
         let tail = past.map_or(&[][..], |(tail, _)| tail);
         let tail_rows = tail.len() / width;
         assert_eq!(tail_rows, start.min(kernel - 1));
-        for t in 0..n {
-            let position = start + t;
-            for channel in 0..width {
-                let mut sum = 0.0;
-                for j in 0..kernel {
-                    if position + j + 1 >= kernel {
-                        // Inputs before `start` come from the preceding tokens' tail.
-                        let source = position + j + 1 - kernel;
-                        let value = if source >= start {
-                            raw[(source - start) * width + channel]
-                        } else {
-                            tail[(source + tail_rows - start) * width + channel]
-                        };
-                        sum += value * self.conv[channel * kernel + j];
-                    }
-                }
-                conv[t * width + channel] = silu(sum);
-            }
-        }
+        let conv = convolve(&raw, tail, start, width, kernel, &self.conv);
         let mut state = past.map_or_else(
             || vec![0.0; c.linear_num_value_heads * dk * dv],
             |(_, state)| state.to_vec(),
@@ -701,6 +682,42 @@ impl Delta {
         next_tail.extend_from_slice(&raw[(n - (keep - from_tail)) * width..]);
         (self.out.apply(&out), next_tail, state)
     }
+}
+
+/// Causal depthwise convolution with SiLU over `raw` (`n` rows of `width`
+/// channels) for tokens at positions `start..start + n`; inputs before `start`
+/// come from `tail`, the preceding tokens' last rows.
+fn convolve(
+    raw: &[f32],
+    tail: &[f32],
+    start: usize,
+    width: usize,
+    kernel: usize,
+    weights: &[f32],
+) -> Vec<f32> {
+    let n = raw.len() / width;
+    let tail_rows = tail.len() / width;
+    let mut conv = vec![0.0; raw.len()];
+    for t in 0..n {
+        let position = start + t;
+        for channel in 0..width {
+            let mut sum = 0.0;
+            for j in 0..kernel {
+                if position + j + 1 >= kernel {
+                    // Inputs before `start` come from the preceding tokens' tail.
+                    let source = position + j + 1 - kernel;
+                    let value = if source >= start {
+                        raw[(source - start) * width + channel]
+                    } else {
+                        tail[(source + tail_rows - start) * width + channel]
+                    };
+                    sum += value * weights[channel * kernel + j];
+                }
+            }
+            conv[t * width + channel] = silu(sum);
+        }
+    }
+    conv
 }
 
 /// Shapes and per-head constants of the Gated DeltaNet recurrence.
@@ -862,6 +879,172 @@ mod tests {
             .validate_layout(4096, 4096, 4, &limits)
             .unwrap_err()
             .contains("budget"));
+    }
+
+    /// Per-operator timing of one DeltaNet layer, one full-attention layer and
+    /// their MLPs at the Qwen3.5-2B dimensions, with synthetic BF16 weights and
+    /// rank-16 F32 adapters. Prints one line per operator.
+    #[test]
+    #[ignore = "real-size operator profile; run with --release and a fixed RAYON_NUM_THREADS"]
+    fn profile_layer_operators() {
+        use crate::Precision;
+        use std::{hint::black_box, time::Instant};
+        let (h, inter, rank) = (2048, 6144, 16);
+        let (heads, kv_heads, head_dim) = (8, 2, 256);
+        let (lk, lv, dk, dv, kernel) = (16, 16, 128, 128, 4);
+        let (kd, vd) = (lk * dk, lv * dv);
+        let tokens: Vec<usize> = std::env::var("PROFILE_TOKENS")
+            .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![64, 512, 2048]);
+        let modes = [Precision::Checkpoint, Precision::Int8Compute];
+        println!(
+            "profile arch={} workers={}",
+            std::env::consts::ARCH,
+            rayon::current_num_threads()
+        );
+        let time = |label: &str, precision: Precision, n: usize, f: &mut dyn FnMut()| {
+            f();
+            let start = Instant::now();
+            for _ in 0..2 {
+                f();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 2.0;
+            println!("profile precision={precision:?} tokens={n} op={label} ms={ms:.2}");
+        };
+        for precision in modes {
+            let lin = |i, o, seed| Linear::synthetic(i, o, rank, seed, precision);
+            let delta = Delta {
+                qkv: lin(h, 2 * kd + vd, 1),
+                z: lin(h, vd, 2),
+                a: lin(h, lv, 3),
+                b: lin(h, lv, 4),
+                out: lin(vd, h, 5),
+                conv: (0..(2 * kd + vd) * kernel)
+                    .map(|i| (i % 7) as f32 / 9.0 - 0.3)
+                    .collect(),
+                dt: vec![0.1; lv],
+                decay_rate: vec![-0.5; lv],
+                norm: vec![1.0; dv],
+            };
+            let full = Full {
+                q: lin(h, heads * head_dim * 2, 6),
+                k: lin(h, kv_heads * head_dim, 7),
+                v: lin(h, kv_heads * head_dim, 8),
+                o: lin(heads * head_dim, h, 9),
+                q_norm: vec![0.1; head_dim],
+                k_norm: vec![0.1; head_dim],
+            };
+            let (gate, up, down) = (lin(h, inter, 10), lin(h, inter, 11), lin(inter, h, 12));
+            for &n in &tokens {
+                let x: Vec<f32> = (0..n * h)
+                    .map(|i| ((i * 43 % 113) as f32 - 56.0) / 64.0)
+                    .collect();
+                let raw = delta.qkv.apply(&x);
+                let (a, b, z) = (delta.a.apply(&x), delta.b.apply(&x), delta.z.apply(&x));
+                let conv = convolve(&raw, &[], 0, 2 * kd + vd, kernel, &delta.conv);
+                let recurrence = Recurrence {
+                    key_heads: lk,
+                    value_heads: lv,
+                    dk,
+                    dv,
+                    eps: 1e-6,
+                    decay_rate: &delta.decay_rate,
+                    dt: &delta.dt,
+                    norm: &delta.norm,
+                };
+                let mixed: Vec<f32> = (0..n * vd).map(|i| (i % 5) as f32 / 5.0).collect();
+                time("delta.in_proj_qkv", precision, n, &mut || {
+                    black_box(delta.qkv.apply(&x));
+                });
+                time("delta.in_proj_z", precision, n, &mut || {
+                    black_box(delta.z.apply(&x));
+                });
+                time("delta.in_proj_a+b", precision, n, &mut || {
+                    black_box((delta.a.apply(&x), delta.b.apply(&x)));
+                });
+                time("delta.conv1d", precision, n, &mut || {
+                    black_box(convolve(&raw, &[], 0, 2 * kd + vd, kernel, &delta.conv));
+                });
+                time("delta.recurrence", precision, n, &mut || {
+                    let mut state = vec![0.0; lv * dk * dv];
+                    black_box(recurrence.run(&conv, &a, &b, &z, &mut state));
+                });
+                time("delta.out_proj", precision, n, &mut || {
+                    black_box(delta.out.apply(&mixed));
+                });
+                let c = Config {
+                    hidden_size: h,
+                    intermediate_size: inter,
+                    num_hidden_layers: 1,
+                    vocab_size: 1,
+                    layer_types: vec!["full_attention".into()],
+                    num_attention_heads: heads,
+                    num_key_value_heads: kv_heads,
+                    head_dim,
+                    rms_norm_eps: 1e-6,
+                    linear_conv_kernel_dim: kernel,
+                    linear_key_head_dim: dk,
+                    linear_value_head_dim: dv,
+                    linear_num_key_heads: lk,
+                    linear_num_value_heads: lv,
+                    rope_parameters: Rope {
+                        rope_theta: 1e7,
+                        partial_rotary_factor: 0.25,
+                        rope_type: "default".into(),
+                    },
+                    attention_bias: false,
+                    attn_output_gate: true,
+                    hidden_act: "silu".into(),
+                };
+                time("delta.layer_mixer_total", precision, n, &mut || {
+                    black_box(delta.forward(&x, &c, 0, None));
+                });
+                let angles: Vec<(f32, f32)> =
+                    (0..n * 32).map(|i| (i as f32 / 1000.0).sin_cos()).collect();
+                let (q, k, v) = (
+                    (0..n * heads * head_dim)
+                        .map(|i| (i % 11) as f32 / 11.0)
+                        .collect::<Vec<f32>>(),
+                    (0..n * kv_heads * head_dim)
+                        .map(|i| (i % 13) as f32 / 13.0)
+                        .collect::<Vec<f32>>(),
+                    (0..n * kv_heads * head_dim)
+                        .map(|i| (i % 7) as f32 / 7.0)
+                        .collect::<Vec<f32>>(),
+                );
+                let attended: Vec<f32> = (0..n * heads * head_dim)
+                    .map(|i| (i % 3) as f32 / 3.0)
+                    .collect();
+                time("full.q_proj", precision, n, &mut || {
+                    black_box(full.q.apply(&x));
+                });
+                time("full.k+v_proj", precision, n, &mut || {
+                    black_box((full.k.apply(&x), full.v.apply(&x)));
+                });
+                time("full.attention_core", precision, n, &mut || {
+                    black_box(causal_attention(&q, &k, &v, heads, kv_heads, head_dim, 0));
+                });
+                time("full.o_proj", precision, n, &mut || {
+                    black_box(full.o.apply(&attended));
+                });
+                time("full.layer_mixer_total", precision, n, &mut || {
+                    black_box(full.forward(&x, &c, &angles, None));
+                });
+                time("mlp.gate+up+down", precision, n, &mut || {
+                    let mut g = gate.apply(&x);
+                    up.apply_into(&x, &mut g, Epilogue::SwiGlu);
+                    let mut residual = x.clone();
+                    down.apply_into(&g, &mut residual, Epilogue::Add);
+                    black_box(residual);
+                });
+                time("norms(2x rms)", precision, n, &mut || {
+                    let mut t = x.clone();
+                    rms(&mut t, &vec![0.1; h], 1e-6, true);
+                    rms(&mut t, &vec![0.1; h], 1e-6, true);
+                    black_box(t);
+                });
+            }
+        }
     }
 
     #[test]

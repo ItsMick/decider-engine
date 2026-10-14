@@ -344,6 +344,11 @@ fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
     let inputs = QuantizedInputs::new(x, input)?;
     let groups = input.div_ceil(64);
     let kernel = Kernel::detect();
+    if kernel.tiles(input) {
+        return Some(linear_int8_tiled(
+            &inputs, projection, values, scales, &kernel,
+        ));
+    }
     let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
         let w = &values[column * input..(column + 1) * input];
         let w_scales = &scales[column * groups..(column + 1) * groups];
@@ -385,6 +390,82 @@ fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
         }
     }
     Some(columns)
+}
+
+/// `linear_int8` with native dot products: 4x4 blocks of rows and weight rows
+/// share loads and group reductions. Every output equals `Kernel::scaled_dot`
+/// exactly, followed by the same bias and adapter steps as the per-output path.
+fn linear_int8_tiled(
+    inputs: &QuantizedInputs,
+    projection: &Projection<'_>,
+    values: &[u8],
+    scales: &[f32],
+    kernel: &Kernel,
+) -> Vec<f32> {
+    use crate::int8::{TILE_COLUMNS as TC, TILE_ROWS as TR};
+    let (input, output) = (projection.input, projection.output);
+    let groups = input.div_ceil(64);
+    let rows = inputs.values.len() / input;
+    let x: Vec<&[i8]> = inputs.values.chunks_exact(input).collect();
+    let x_scales: Vec<&[f32]> = inputs.scales.chunks_exact(groups).collect();
+    let compute = |block: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
+        let first = block * TC;
+        let count = dst.len() / rows;
+        let w: Vec<&[u8]> = (first..first + count)
+            .map(|c| &values[c * input..(c + 1) * input])
+            .collect();
+        let w_scales: Vec<&[f32]> = (first..first + count)
+            .map(|c| &scales[c * groups..(c + 1) * groups])
+            .collect();
+        let mut row = 0;
+        if count == TC {
+            while row + TR <= rows {
+                let tile = kernel.scaled_tile(
+                    std::array::from_fn(|r| x[row + r]),
+                    std::array::from_fn(|r| x_scales[row + r]),
+                    std::array::from_fn(|c| w[c]),
+                    std::array::from_fn(|c| w_scales[c]),
+                );
+                for (r, sums) in tile.iter().enumerate() {
+                    for (c, sum) in sums.iter().enumerate() {
+                        dst[c * rows + row + r] = *sum;
+                    }
+                }
+                row += TR;
+            }
+        }
+        for row in row..rows {
+            for c in 0..count {
+                dst[c * rows + row] = kernel.scaled_dot(x[row], x_scales[row], w[c], w_scales[c]);
+            }
+        }
+        for (c, column) in dst.chunks_mut(rows).enumerate() {
+            let adapter = projection
+                .adapter
+                .as_ref()
+                .map(|a| (a, a.weights.row((first + c) * a.rank, a.rank, scratch)));
+            let bias = projection.bias.map_or(0.0, |b| b[first + c]);
+            for (row, value) in column.iter_mut().enumerate() {
+                let base = *value + bias;
+                *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+            }
+        }
+    };
+    let mut columns = vec![0.0; rows * output];
+    if rows * output >= 512 {
+        columns
+            .par_chunks_mut(rows * TC)
+            .enumerate()
+            .for_each_init(Vec::new, |scratch, (block, dst)| {
+                compute(block, dst, scratch)
+            });
+    } else {
+        let mut scratch = Vec::new();
+        for (block, dst) in columns.chunks_mut(rows * TC).enumerate() {
+            compute(block, dst, &mut scratch);
+        }
+    }
+    columns
 }
 
 pub(crate) fn softmax(values: &mut [f32]) {
@@ -512,6 +593,76 @@ mod tests {
                             "width {input}, row {row}, column {column}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_projection_tiles_match_per_output_scaled_dots() {
+        let kernel = Kernel::detect();
+        let rank = 3;
+        for (rows, input, output) in [
+            (1usize, 64usize, 4usize),
+            (4, 64, 4),
+            (5, 128, 6),
+            (9, 192, 31),
+            (67, 128, 8),
+            (7, 100, 9),
+        ] {
+            let groups = input.div_ceil(64);
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| ((i * 43 % 255) as f32 - 127.0) / 9.0)
+                .collect();
+            let values: Vec<u8> = (0..output * input).map(|i| (i * 71 + 128) as u8).collect();
+            let scales: Vec<f32> = (0..output * groups)
+                .map(|i| (i % 7 + 1) as f32 / 32.0)
+                .collect();
+            let weights = Data::Quantized {
+                values: values.clone(),
+                scales: scales.clone(),
+                width: input,
+                elements: output * input,
+                bits: 8,
+                compute_int8: true,
+            };
+            let bias: Vec<f32> = (0..output).map(|i| i as f32 / 16.0 - 0.5).collect();
+            let mid: Vec<f32> = (0..rows * rank)
+                .map(|i| (i % 9) as f32 / 4.0 - 1.0)
+                .collect();
+            let adapter_weights =
+                Data::F32((0..output * rank).map(|i| (i % 7) as f32 / 8.0).collect());
+            let projection = Projection {
+                input,
+                output,
+                weights: &weights,
+                bias: Some(&bias),
+                adapter: Some(Adapter {
+                    inputs: &mid,
+                    weights: &adapter_weights,
+                    rank,
+                    scale: 0.375,
+                }),
+            };
+            let actual = projection.columns(&x);
+            let quantized = QuantizedInputs::new(&x, input).unwrap();
+            let mut scratch = Vec::new();
+            for column in 0..output {
+                let a = projection.adapter.as_ref().unwrap();
+                let aw = a.weights.row(column * rank, rank, &mut scratch).to_vec();
+                for row in 0..rows {
+                    let sum = kernel.scaled_dot(
+                        &quantized.values[row * input..(row + 1) * input],
+                        &quantized.scales[row * groups..(row + 1) * groups],
+                        &values[column * input..(column + 1) * input],
+                        &scales[column * groups..(column + 1) * groups],
+                    );
+                    let expected = a.combine(sum + bias[column], row, &aw);
+                    assert_eq!(
+                        actual[column * rows + row].to_bits(),
+                        expected.to_bits(),
+                        "{rows}x{input}->{output} row {row} column {column}"
+                    );
                 }
             }
         }
