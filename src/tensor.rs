@@ -24,6 +24,64 @@ pub(crate) fn dot_scores(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Projection columns computed together. On AArch64, 3x3 tiles of `dot_tile`
+/// measured 1.3-1.9x faster than one `dot_scores` at a time on Neoverse-N1 and
+/// Apple CPUs; on x86-64 tiling was slower, so it keeps single dot products.
+const TILE: usize = if cfg!(target_arch = "aarch64") { 3 } else { 1 };
+
+/// Per-worker conversion buffers for packed weight and adapter rows.
+struct Scratch<const T: usize> {
+    weights: [Vec<f32>; T],
+    adapter: Vec<f32>,
+}
+impl<const T: usize> Scratch<T> {
+    fn new() -> Self {
+        Self {
+            weights: std::array::from_fn(|_| Vec::new()),
+            adapter: Vec::new(),
+        }
+    }
+}
+
+/// Nine dot products, rows of `xs` against rows of `ws`. Each keeps the exact
+/// operation order of `dot_scores` (eight lanes, their sum, then the tail), so
+/// results are bit-identical; nine independent accumulator chains let the CPU
+/// overlap them, and each loaded chunk is reused three times.
+#[inline(never)]
+pub(crate) fn dot_tile(xs: [&[f32]; 3], ws: [&[f32]; 3]) -> [[f32; 3]; 3] {
+    let len = xs[0].len();
+    assert!(xs.iter().chain(&ws).all(|v| v.len() == len));
+    let chunks = len / 8;
+    let xr: [&[[f32; 8]]; 3] = std::array::from_fn(|i| xs[i].as_chunks::<8>().0);
+    let wr: [&[[f32; 8]]; 3] = std::array::from_fn(|j| ws[j].as_chunks::<8>().0);
+    let mut lanes = [[0.0f32; 8]; 9];
+    for k in 0..chunks {
+        let a: [[f32; 8]; 3] = std::array::from_fn(|i| xr[i][k]);
+        let b: [[f32; 8]; 3] = std::array::from_fn(|j| wr[j][k]);
+        for i in 0..3 {
+            for j in 0..3 {
+                let acc = &mut lanes[i * 3 + j];
+                for q in 0..8 {
+                    if cfg!(target_arch = "aarch64") {
+                        acc[q] = a[i][q].mul_add(b[j][q], acc[q]);
+                    } else {
+                        acc[q] += a[i][q] * b[j][q];
+                    }
+                }
+            }
+        }
+    }
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let mut sum = lanes[i * 3 + j].iter().sum::<f32>();
+            for t in chunks * 8..len {
+                sum += xs[i][t] * ws[j][t];
+            }
+            sum
+        })
+    })
+}
+
 /// Operations applied while transposing completed projection values.
 #[derive(Clone, Copy)]
 pub(crate) enum Epilogue {
@@ -115,8 +173,6 @@ impl Projection<'_> {
     }
 
     fn columns(&self, x: &[f32]) -> Vec<f32> {
-        let (input, output) = (self.input, self.output);
-        let rows = x.len() / input;
         if let Data::Quantized {
             bits: 8,
             compute_int8: true,
@@ -127,28 +183,71 @@ impl Projection<'_> {
                 return columns;
             }
         }
-        let compute = |column: usize, dst: &mut [f32], scratch: &mut (Vec<f32>, Vec<f32>)| {
-            let w = self.weights.row(column * input, input, &mut scratch.0);
-            let adapter = self
-                .adapter
-                .as_ref()
-                .map(|a| (a, a.weights.row(column * a.rank, a.rank, &mut scratch.1)));
-            let b = self.bias.map_or(0.0, |b| b[column]);
-            for (row, (value, token)) in dst.iter_mut().zip(x.chunks_exact(input)).enumerate() {
-                let base = dot_scores(token, w) + b;
-                *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+        self.columns_tiled::<TILE>(x)
+    }
+
+    /// Single-dot-product columns when `T` is 1; 3x3 `dot_tile` blocks when `T`
+    /// is 3. Both produce bit-identical results.
+    fn columns_tiled<const T: usize>(&self, x: &[f32]) -> Vec<f32> {
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
+        let tokens: Vec<&[f32]> = x.chunks_exact(input).collect();
+        // Each task computes T adjacent columns for every row.
+        let compute = |group: usize, dst: &mut [f32], scratch: &mut Scratch<T>| {
+            let first = group * T;
+            let count = dst.len() / rows;
+            let weights: Vec<&[f32]> = scratch.weights[..count]
+                .iter_mut()
+                .enumerate()
+                .map(|(j, buf)| self.weights.row((first + j) * input, input, buf))
+                .collect();
+            let mut row = 0;
+            if let [w0, w1, w2] = weights[..] {
+                while row + 3 <= rows {
+                    let tile = dot_tile(
+                        [tokens[row], tokens[row + 1], tokens[row + 2]],
+                        [w0, w1, w2],
+                    );
+                    for (i, values) in tile.iter().enumerate() {
+                        for (j, value) in values.iter().enumerate() {
+                            dst[j * rows + row + i] = *value;
+                        }
+                    }
+                    row += 3;
+                }
+            }
+            for row in row..rows {
+                for (j, w) in weights.iter().enumerate() {
+                    dst[j * rows + row] = dot_scores(tokens[row], w);
+                }
+            }
+            for (j, column) in dst.chunks_mut(rows).enumerate() {
+                let adapter = self.adapter.as_ref().map(|a| {
+                    (
+                        a,
+                        a.weights
+                            .row((first + j) * a.rank, a.rank, &mut scratch.adapter),
+                    )
+                });
+                let b = self.bias.map_or(0.0, |b| b[first + j]);
+                for (row, value) in column.iter_mut().enumerate() {
+                    let base = *value + b;
+                    *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+                }
             }
         };
         let mut columns = vec![0.0; rows * output];
         if rows * output >= 512 {
-            columns.par_chunks_mut(rows).enumerate().for_each_init(
-                || (Vec::new(), Vec::new()),
-                |scratch, (column, dst)| compute(column, dst, scratch),
-            );
+            columns
+                .par_chunks_mut(rows * T)
+                .enumerate()
+                .for_each_init(Scratch::new, |scratch, (group, dst)| {
+                    compute(group, dst, scratch)
+                });
         } else {
-            let mut scratch = (Vec::new(), Vec::new());
-            for (column, dst) in columns.chunks_mut(rows).enumerate() {
-                compute(column, dst, &mut scratch);
+            let mut scratch = Scratch::new();
+            for (group, dst) in columns.chunks_mut(rows * T).enumerate() {
+                compute(group, dst, &mut scratch);
             }
         }
         columns
@@ -305,6 +404,7 @@ pub(crate) fn softmax(values: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Precision;
 
     #[test]
     #[ignore = "synthetic timing; run with --release and a fixed RAYON_NUM_THREADS"]
@@ -451,6 +551,138 @@ mod tests {
             let mut result = [0.0];
             linear(&[nonfinite], 1, 1, &weights, 1, None, &mut result);
             assert!(!result[0].is_finite());
+        }
+    }
+
+    #[test]
+    fn dot_tile_matches_dot_scores_bit_for_bit() {
+        for len in (0..=40).chain([63, 64, 65, 131, 2048]) {
+            let v = |seed: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| match (i + seed) % 11 {
+                        0 => -0.0,
+                        1 => 1e-30,
+                        2 => -3.5e8,
+                        k => ((i * 37 + seed * 101) % 997) as f32 / 61.0 - 8.0 + k as f32 / 7.0,
+                    })
+                    .collect()
+            };
+            let xs = [v(1), v(2), v(3)];
+            let ws = [v(4), v(5), v(6)];
+            let tile = dot_tile([&xs[0], &xs[1], &xs[2]], [&ws[0], &ws[1], &ws[2]]);
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_eq!(
+                        tile[i][j].to_bits(),
+                        dot_scores(&xs[i], &ws[j]).to_bits(),
+                        "len {len}, ({i}, {j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_columns_match_single_dot_products_in_every_layout() {
+        // The pre-tiling kernel: one dot product per output, then bias and adapter.
+        fn reference(p: &Projection<'_>, x: &[f32]) -> Vec<f32> {
+            let rows = x.len() / p.input;
+            let mut out = vec![0.0; rows * p.output];
+            let (mut ws, mut aw) = (Vec::new(), Vec::new());
+            for column in 0..p.output {
+                let w = p.weights.row(column * p.input, p.input, &mut ws).to_vec();
+                let adapter = p
+                    .adapter
+                    .as_ref()
+                    .map(|a| (a, a.weights.row(column * a.rank, a.rank, &mut aw).to_vec()));
+                let b = p.bias.map_or(0.0, |b| b[column]);
+                for (row, token) in x.chunks_exact(p.input).enumerate() {
+                    let base = dot_scores(token, &w) + b;
+                    out[column * rows + row] = adapter
+                        .as_ref()
+                        .map_or(base, |(a, w)| a.combine(base, row, w));
+                }
+            }
+            out
+        }
+        let rank = 5;
+        for (rows, input, output) in [
+            (1, 9, 1),
+            (2, 17, 2),
+            (3, 8, 3),
+            (4, 33, 4),
+            (7, 64, 5),
+            (19, 131, 31),
+            (67, 40, 7),
+        ] {
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| ((i * 43 % 113) as f32 - 56.0) / 32.0)
+                .collect();
+            let mid: Vec<f32> = (0..rows * rank)
+                .map(|i| (i % 9) as f32 / 4.0 - 1.0)
+                .collect();
+            let bias: Vec<f32> = (0..output).map(|i| i as f32 / 16.0 - 0.25).collect();
+            let adapter_weights = Data::F32(
+                (0..output * rank)
+                    .map(|i| (i % 7) as f32 / 8.0 - 0.4)
+                    .collect(),
+            );
+            let bf16 = |n: usize| {
+                Data::Bf16(
+                    (0..n)
+                        .map(|i| ((((i * 17 % 89) as f32 - 44.0) / 32.0).to_bits() >> 16) as u16)
+                        .collect(),
+                )
+            };
+            for (weights, label) in [
+                (
+                    Data::F32(
+                        (0..output * input)
+                            .map(|i| (i % 13) as f32 / 5.0 - 1.2)
+                            .collect(),
+                    ),
+                    "f32",
+                ),
+                (bf16(output * input), "bf16"),
+                (
+                    bf16(output * input).quantize(input, Precision::Int8),
+                    "int8",
+                ),
+                (
+                    bf16(output * input).quantize(input, Precision::Int4),
+                    "int4",
+                ),
+            ] {
+                for (with_bias, with_adapter) in [(false, false), (true, false), (true, true)] {
+                    let projection = Projection {
+                        input,
+                        output,
+                        weights: &weights,
+                        bias: with_bias.then_some(&bias[..]),
+                        adapter: with_adapter.then(|| Adapter {
+                            inputs: &mid,
+                            weights: &adapter_weights,
+                            rank,
+                            scale: 0.375,
+                        }),
+                    };
+                    let expected = reference(&projection, &x);
+                    // Both tile widths on every architecture, plus the selected one.
+                    for actual in [
+                        projection.columns(&x),
+                        projection.columns_tiled::<1>(&x),
+                        projection.columns_tiled::<3>(&x),
+                    ] {
+                        assert!(
+                            actual
+                                .iter()
+                                .zip(&expected)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{label} {rows}x{input}->{output} bias={with_bias} adapter={with_adapter}"
+                        );
+                    }
+                }
+            }
         }
     }
 
