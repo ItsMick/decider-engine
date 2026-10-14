@@ -567,61 +567,116 @@ impl Delta {
                 conv[t * width + channel] = silu(sum);
             }
         }
+        let out = Recurrence {
+            key_heads: c.linear_num_key_heads,
+            value_heads: c.linear_num_value_heads,
+            dk,
+            dv,
+            eps: c.rms_norm_eps,
+            decay_rate: &self.decay_rate,
+            dt: &self.dt,
+            norm: &self.norm,
+        }
+        .run(&conv, &a, &b, &z);
+        self.out.apply(&out)
+    }
+}
+
+/// Shapes and per-head constants of the Gated DeltaNet recurrence.
+struct Recurrence<'a> {
+    key_heads: usize,
+    value_heads: usize,
+    dk: usize,
+    dv: usize,
+    eps: f32,
+    decay_rate: &'a [f32],
+    dt: &'a [f32],
+    norm: &'a [f32],
+}
+
+impl Recurrence<'_> {
+    /// Normalized, gated output `[n, value_heads * dv]` from the convolved q/k/v
+    /// channels and the `a`, `b` and `z` projections of `n` tokens.
+    fn run(&self, conv: &[f32], a: &[f32], b: &[f32], z: &[f32]) -> Vec<f32> {
+        let (dk, dv, heads) = (self.dk, self.dv, self.value_heads);
+        let vd = heads * dv;
+        let n = conv.len() / (2 * self.key_heads * dk + vd);
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut by_head = vec![0.0; heads * n * dv];
+        let run = |(head, dst): (usize, &mut [f32])| self.head(head, conv, a, b, z, dst);
+        // Heads own disjoint state and output rows, so running them in parallel
+        // changes no arithmetic. Short sequences stay on the calling thread.
+        if heads > 1 && n * dk * dv >= 1 << 16 && rayon::current_num_threads() > 1 {
+            by_head.par_chunks_mut(n * dv).enumerate().for_each(run);
+        } else {
+            by_head.chunks_mut(n * dv).enumerate().for_each(run);
+        }
         let mut out = vec![0.0; n * vd];
-        let mut state = vec![0.0; c.linear_num_value_heads * dk * dv];
+        for (head, rows) in by_head.chunks_exact(n * dv).enumerate() {
+            for (t, row) in rows.chunks_exact(dv).enumerate() {
+                out[t * vd + head * dv..t * vd + (head + 1) * dv].copy_from_slice(row);
+            }
+        }
+        out
+    }
+
+    /// One value head over every token, writing `[n, dv]` rows to `dst`.
+    fn head(&self, head: usize, conv: &[f32], a: &[f32], b: &[f32], z: &[f32], dst: &mut [f32]) {
+        let (dk, dv, heads) = (self.dk, self.dv, self.value_heads);
+        let kd = self.key_heads * dk;
+        let vd = heads * dv;
+        let width = 2 * kd + vd;
+        let kh = head / (heads / self.key_heads);
+        let mut state = vec![0.0; dk * dv];
         let mut q = vec![0.0; dk];
         let mut k = vec![0.0; dk];
         let mut delta = vec![0.0; dv];
-        for t in 0..n {
-            for head in 0..c.linear_num_value_heads {
-                let kh = head / (c.linear_num_value_heads / c.linear_num_key_heads);
-                q.copy_from_slice(&conv[t * width + kh * dk..t * width + (kh + 1) * dk]);
-                k.copy_from_slice(&conv[t * width + kd + kh * dk..t * width + kd + (kh + 1) * dk]);
-                let qnorm = (q.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip()
-                    / (dk as f32).sqrt();
-                let knorm = (k.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip();
-                for v in &mut q {
-                    *v *= qnorm;
-                }
-                for v in &mut k {
-                    *v *= knorm;
-                }
-                let decay = (self.decay_rate[head]
-                    * softplus(a[t * c.linear_num_value_heads + head] + self.dt[head]))
-                .exp();
-                let beta = sigmoid(b[t * c.linear_num_value_heads + head]);
-                let st = &mut state[head * dk * dv..(head + 1) * dk * dv];
-                for v in st.iter_mut() {
-                    *v *= decay;
-                }
-                delta.fill(0.0);
-                for (row, ki) in st.chunks_exact(dv).zip(&k) {
-                    for (m, s) in delta.iter_mut().zip(row) {
-                        *m += ki * s;
-                    }
-                }
-                for (m, v) in delta.iter_mut().zip(
-                    &conv[t * width + 2 * kd + head * dv..t * width + 2 * kd + (head + 1) * dv],
-                ) {
-                    *m = (v - *m) * beta;
-                }
-                let dst = &mut out[t * vd + head * dv..t * vd + (head + 1) * dv];
-                for ((row, ki), qi) in st.chunks_exact_mut(dv).zip(&k).zip(&q) {
-                    for ((s, de), o) in row.iter_mut().zip(&delta).zip(dst.iter_mut()) {
-                        *s += ki * de;
-                        *o += qi * (*s);
-                    }
-                }
-                rms(dst, &self.norm, c.rms_norm_eps, false);
-                for (o, g) in dst
-                    .iter_mut()
-                    .zip(&z[t * vd + head * dv..t * vd + (head + 1) * dv])
-                {
-                    *o *= silu(*g);
+        for (t, dst) in dst.chunks_exact_mut(dv).enumerate() {
+            q.copy_from_slice(&conv[t * width + kh * dk..t * width + (kh + 1) * dk]);
+            k.copy_from_slice(&conv[t * width + kd + kh * dk..t * width + kd + (kh + 1) * dk]);
+            let qnorm =
+                (q.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip() / (dk as f32).sqrt();
+            let knorm = (k.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip();
+            for v in &mut q {
+                *v *= qnorm;
+            }
+            for v in &mut k {
+                *v *= knorm;
+            }
+            let decay =
+                (self.decay_rate[head] * softplus(a[t * heads + head] + self.dt[head])).exp();
+            let beta = sigmoid(b[t * heads + head]);
+            for v in state.iter_mut() {
+                *v *= decay;
+            }
+            delta.fill(0.0);
+            for (row, ki) in state.chunks_exact(dv).zip(&k) {
+                for (m, s) in delta.iter_mut().zip(row) {
+                    *m += ki * s;
                 }
             }
+            for (m, v) in delta
+                .iter_mut()
+                .zip(&conv[t * width + 2 * kd + head * dv..t * width + 2 * kd + (head + 1) * dv])
+            {
+                *m = (v - *m) * beta;
+            }
+            for ((row, ki), qi) in state.chunks_exact_mut(dv).zip(&k).zip(&q) {
+                for ((s, de), o) in row.iter_mut().zip(&delta).zip(dst.iter_mut()) {
+                    *s += ki * de;
+                    *o += qi * (*s);
+                }
+            }
+            rms(dst, self.norm, self.eps, false);
+            for (o, g) in dst
+                .iter_mut()
+                .zip(&z[t * vd + head * dv..t * vd + (head + 1) * dv])
+            {
+                *o *= silu(*g);
+            }
         }
-        self.out.apply(&out)
     }
 }
 
@@ -725,6 +780,182 @@ mod tests {
                     "attention tokens={n} workers={} mean_ms={:.3}",
                     pool.current_num_threads(),
                     start.elapsed().as_secs_f64() * 1000.0 / 3.0
+                );
+            }
+        }
+    }
+
+    /// The original token-major recurrence, kept as the bit-exact reference.
+    fn reference_recurrence(
+        r: &Recurrence,
+        conv: &[f32],
+        a: &[f32],
+        b: &[f32],
+        z: &[f32],
+    ) -> Vec<f32> {
+        let (dk, dv, heads) = (r.dk, r.dv, r.value_heads);
+        let kd = r.key_heads * dk;
+        let vd = heads * dv;
+        let width = 2 * kd + vd;
+        let n = conv.len() / width;
+        let mut out = vec![0.0; n * vd];
+        let mut state = vec![0.0; heads * dk * dv];
+        let mut q = vec![0.0; dk];
+        let mut k = vec![0.0; dk];
+        let mut delta = vec![0.0; dv];
+        for t in 0..n {
+            for head in 0..heads {
+                let kh = head / (heads / r.key_heads);
+                q.copy_from_slice(&conv[t * width + kh * dk..t * width + (kh + 1) * dk]);
+                k.copy_from_slice(&conv[t * width + kd + kh * dk..t * width + kd + (kh + 1) * dk]);
+                let qnorm = (q.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip()
+                    / (dk as f32).sqrt();
+                let knorm = (k.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt().recip();
+                for v in &mut q {
+                    *v *= qnorm;
+                }
+                for v in &mut k {
+                    *v *= knorm;
+                }
+                let decay = (r.decay_rate[head] * softplus(a[t * heads + head] + r.dt[head])).exp();
+                let beta = sigmoid(b[t * heads + head]);
+                let st = &mut state[head * dk * dv..(head + 1) * dk * dv];
+                for v in st.iter_mut() {
+                    *v *= decay;
+                }
+                delta.fill(0.0);
+                for (row, ki) in st.chunks_exact(dv).zip(&k) {
+                    for (m, s) in delta.iter_mut().zip(row) {
+                        *m += ki * s;
+                    }
+                }
+                for (m, v) in delta.iter_mut().zip(
+                    &conv[t * width + 2 * kd + head * dv..t * width + 2 * kd + (head + 1) * dv],
+                ) {
+                    *m = (v - *m) * beta;
+                }
+                let dst = &mut out[t * vd + head * dv..t * vd + (head + 1) * dv];
+                for ((row, ki), qi) in st.chunks_exact_mut(dv).zip(&k).zip(&q) {
+                    for ((s, de), o) in row.iter_mut().zip(&delta).zip(dst.iter_mut()) {
+                        *s += ki * de;
+                        *o += qi * (*s);
+                    }
+                }
+                rms(dst, r.norm, r.eps, false);
+                for (o, g) in dst
+                    .iter_mut()
+                    .zip(&z[t * vd + head * dv..t * vd + (head + 1) * dv])
+                {
+                    *o *= silu(*g);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "synthetic recurrence timing; run with --release"]
+    fn benchmark_deltanet_recurrence() {
+        use std::{hint::black_box, time::Instant};
+        // Qwen3.5-2B linear-attention shape: 16 key and value heads of 128.
+        let (key_heads, value_heads, dk, dv) = (16, 16, 128, 128);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let pools: Vec<_> = [1, threads]
+            .into_iter()
+            .map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let decay_rate = vec![-0.5; value_heads];
+        let dt = vec![0.1; value_heads];
+        let norm = vec![1.0; dv];
+        let recurrence = Recurrence {
+            key_heads,
+            value_heads,
+            dk,
+            dv,
+            eps: 1e-6,
+            decay_rate: &decay_rate,
+            dt: &dt,
+            norm: &norm,
+        };
+        for n in [32, 128, 512] {
+            let width = 2 * key_heads * dk + value_heads * dv;
+            let conv: Vec<f32> = (0..n * width)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 23.0)
+                .collect();
+            let gates: Vec<f32> = (0..n * value_heads).map(|i| (i % 7) as f32 / 7.0).collect();
+            let z: Vec<f32> = (0..n * value_heads * dv)
+                .map(|i| (i % 5) as f32 / 5.0)
+                .collect();
+            for pool in &pools {
+                pool.install(|| black_box(recurrence.run(&conv, &gates, &gates, &z)));
+                let start = Instant::now();
+                for _ in 0..3 {
+                    pool.install(|| {
+                        black_box(recurrence.run(black_box(&conv), &gates, &gates, &z))
+                    });
+                }
+                println!(
+                    "deltanet tokens={n} workers={} mean_ms={:.3}",
+                    pool.current_num_threads(),
+                    start.elapsed().as_secs_f64() * 1000.0 / 3.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_deltanet_heads_match_the_token_major_recurrence_exactly() {
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        // Small shapes take the serial path; 32x32 heads over 80 tokens cross the
+        // parallel threshold. Includes grouped value heads per key head.
+        for (key_heads, value_heads, dk, dv, n) in [
+            (1, 1, 4, 3, 5),
+            (2, 4, 8, 6, 17),
+            (2, 4, 32, 32, 80),
+            (4, 4, 32, 32, 64),
+        ] {
+            let width = 2 * key_heads * dk + value_heads * dv;
+            let wave = |len: usize, a: usize, b: usize, scale: f32| -> Vec<f32> {
+                (0..len)
+                    .map(|i| ((i * a % b) as f32 - (b / 2) as f32) / scale)
+                    .collect()
+            };
+            let conv = wave(n * width, 37, 101, 23.0);
+            let a = wave(n * value_heads, 11, 17, 5.0);
+            let b = wave(n * value_heads, 13, 19, 4.0);
+            let z = wave(n * value_heads * dv, 7, 29, 9.0);
+            let decay_rate: Vec<f32> = (0..value_heads).map(|h| -0.5 - h as f32 / 7.0).collect();
+            let dt: Vec<f32> = (0..value_heads).map(|h| h as f32 / 11.0 - 0.2).collect();
+            let norm: Vec<f32> = (0..dv).map(|i| 0.75 + i as f32 / 64.0).collect();
+            let recurrence = Recurrence {
+                key_heads,
+                value_heads,
+                dk,
+                dv,
+                eps: 1e-6,
+                decay_rate: &decay_rate,
+                dt: &dt,
+                norm: &norm,
+            };
+            let expected = reference_recurrence(&recurrence, &conv, &a, &b, &z);
+            for pool in &pools {
+                let actual = pool.install(|| recurrence.run(&conv, &a, &b, &z));
+                assert_eq!(
+                    actual, expected,
+                    "{key_heads}/{value_heads} heads, {dk}x{dv}, {n} tokens"
                 );
             }
         }
