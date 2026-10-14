@@ -15,8 +15,8 @@ question and 4,096 total). The complete request is preflighted before inference.
 
 Responses contain the typed engine response plus measurements, request ID,
 environment ID, invocation sequence, one-time model load duration, precision,
-worker count, model revisions and process peak RSS. `integer_kernel()` reports
-the runtime dispatcher also used by integer projections. `DECIDER_REQUIRE_SDOT=1`
+worker count, model revisions and process peak RSS. `metrics.integer_kernel` reports
+the same runtime CPU-feature predicate used by the engine’s integer dispatcher. `DECIDER_REQUIRE_SDOT=1`
 refuses a host without ARM SDOT. This verifies feature selection, not a measured
 speedup; non-finite projection inputs can still take the documented FP32 fallback.
 

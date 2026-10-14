@@ -24,16 +24,6 @@ use std::{collections::BTreeMap, path::Path};
 use weights::{Linear, Weights};
 
 pub const ENGINE_ID: &str = "strands-decider-2b-native";
-/// Runtime-selected integer dot backend used by `Int8Compute` projections.
-/// This is capability/dispatch reporting, not an end-to-end performance claim.
-pub fn integer_kernel() -> &'static str {
-    if int8::Kernel::detect().accelerated() {
-        "aarch64-sdot"
-    } else {
-        "scalar"
-    }
-}
-
 /// Lower precision modes quantize base linear weights only and need quality evaluation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Precision {

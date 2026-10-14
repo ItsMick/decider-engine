@@ -6,6 +6,15 @@ use serde_json::{json, value::RawValue, Value};
 use std::{path::Path, sync::Arc, time::Instant};
 use tokio::sync::Semaphore;
 
+// Same runtime feature predicate as the engine's private integer dispatcher.
+fn integer_kernel() -> &'static str {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        return "aarch64-sdot";
+    }
+    "scalar"
+}
+
 fn parse_request(raw: &str) -> Result<Request, String> {
     if raw == r#""__decider_event_too_large__""#
         || raw.len() > InferenceLimits::lambda().max_request_bytes
@@ -55,7 +64,7 @@ async fn main() -> Result<(), Error> {
         precision,
     )?);
     let load_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let kernel = decider_engine::integer_kernel();
+    let kernel = integer_kernel();
     if std::env::var("DECIDER_REQUIRE_SDOT").as_deref() == Ok("1") && kernel != "aarch64-sdot" {
         return Err("deployment requires SDOT but runtime selected scalar integer kernel".into());
     }

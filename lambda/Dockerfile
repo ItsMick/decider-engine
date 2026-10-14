@@ -1,7 +1,7 @@
 # Build natively with `docker buildx build --platform linux/arm64`.
 # Amazon Linux 2023 ensures the bootstrap and runtime use a compatible glibc.
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 AS build
-RUN dnf install -y gcc gcc-c++ make perl openssl-devel curl tar gzip && dnf clean all
+RUN dnf install -y --allowerasing gcc gcc-c++ make perl openssl-devel curl tar gzip && dnf clean all
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh && \
     sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.98.0
 ENV PATH="/root/.cargo/bin:${PATH}"
