@@ -12,16 +12,22 @@ permissions:
   contents: read
 jobs:
   parity:
-    name: v21 checkpoint (${{ matrix.os }})
+    name: v21 checkpoint (${{ matrix.os }}${{ matrix.features && format(', {0}', matrix.features) || '' }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
+        features: ['']
+        include:
+          # The opt-in NEON kernels must reproduce the same reference.
+          - os: ubuntu-24.04-arm
+            features: arm-neon
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
       RAYON_NUM_THREADS: '4'
       DECIDER_TEST_MODEL_DIR: models/v21
+      FEATURES: ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -47,16 +53,16 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo build --release --locked --tests
+          cargo build --release --locked --tests $FEATURES
           start=$SECONDS
-          cargo test --release --locked --test model -- --ignored --nocapture 2>&1 | tee validation/parity.log
+          cargo test --release --locked $FEATURES --test model -- --ignored --nocapture 2>&1 | tee validation/parity.log
           # Wall time of the real-weight test alone (build excluded), for comparing releases.
           echo "parity_test_seconds=$((SECONDS - start))" | tee -a validation/environment.txt
       - name: Preserve validation evidence (no weights)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: v21-parity-${{ matrix.os }}
+          name: v21-parity-${{ matrix.os }}${{ matrix.features && format('-{0}', matrix.features) || '' }}
           path: validation/
           retention-days: 30
 

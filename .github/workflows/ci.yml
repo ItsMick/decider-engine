@@ -53,12 +53,25 @@ jobs:
                   raise SystemExit(f"{name}: unexpected SHA256")
           EOF
           DECIDER_TEST_ENCODER_DIR=encoder cargo test --locked --test encoding -- --ignored
+      - name: Lint and test the arm-neon feature
+        if: matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
+        env:
+          DECIDER_REQUIRE_DOTPROD: '1'
+        run: |
+          cargo clippy --locked --all-targets --features arm-neon -- -D warnings
+          cargo test --locked --features arm-neon
       - name: Profile real-size layer operators on ARM
         if: matrix.os == 'ubuntu-24.04-arm'
         env:
           RAYON_NUM_THREADS: '4'
           PROFILE_TOKENS: '64,512,2048'
         run: cargo test --release --locked --lib profile_layer_operators -- --ignored --nocapture
+      - name: Profile real-size layer operators on ARM with arm-neon
+        if: matrix.os == 'ubuntu-24.04-arm'
+        env:
+          RAYON_NUM_THREADS: '4'
+          PROFILE_TOKENS: '64,512,2048'
+        run: cargo test --release --locked --lib --features arm-neon profile_layer_operators -- --ignored --nocapture
       - name: Measure synthetic ARM projections
         if: matrix.os == 'ubuntu-24.04-arm'
         env:

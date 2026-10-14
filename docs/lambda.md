@@ -18,8 +18,13 @@ incompatible with Amazon Linux; build for the deployment environment.
 
 ```sh
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=neoverse-n1' \
-  cargo build --release --locked --target aarch64-unknown-linux-gnu
+  cargo build --release --locked --target aarch64-unknown-linux-gnu --features arm-neon
 ```
+
+`--features arm-neon` compiles hand-written NEON kernels for little-endian
+AArch64; it has no effect on other targets. They produce bit-identical results
+to the default build (CI checks both against the pinned v21 reference), so the
+feature changes speed, never answers. The included Lambda host enables it.
 
 This command builds the library and CLI when the target toolchain is installed;
 your Lambda host also needs to be compiled for ARM64 and packaged as `bootstrap`.

@@ -199,6 +199,14 @@ smaller batches interleave them. The floating-point arithmetic order is preserve
 Scalar INT8 compute retains a separate projection plan after benchmarking showed
 a cost for fusion on that fallback. Native ARM INT8 compute uses fused writes.
 
+On AArch64, FP32 projections compute 3×3 blocks of outputs and INT8 compute uses
+4×4 SDOT blocks; each output keeps its exact operation order, so results match
+single dot products bit for bit. The opt-in `arm-neon` feature replaces the FP32
+block with hand-written NEON code that keeps its accumulators in registers; it is
+also bit-identical, and a no-op on other architectures. Build for Lambda
+(Graviton2) with `-C target-cpu=neoverse-n1 --features arm-neon`; see
+[ARM64 Lambda notes](docs/lambda.md).
+
 ### Compatibility with upstream Strands
 
 Prompt rendering and token binding match upstream `prompting.py` at the pinned
