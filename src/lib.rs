@@ -305,8 +305,9 @@ fn encode(
     max_length: usize,
 ) -> Result<Encoding, String> {
     // Strands tokenizes the prefix and question independently, then concatenates.
-    let prefix = format!("<state>\n{}\n</state>\n", prompt::render_content(state));
-    let s = tokenizer.encode(prefix, true).map_err(|e| e.to_string())?;
+    let s = tokenizer
+        .encode(prompt::render_state(state), true)
+        .map_err(|e| e.to_string())?;
     let q = tokenizer
         .encode(rendered.text.as_str(), false)
         .map_err(|e| e.to_string())?;
