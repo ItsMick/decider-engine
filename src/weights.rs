@@ -95,7 +95,7 @@ impl Data {
             }
         }
     }
-    fn quantize(self, width: usize, precision: Precision) -> Self {
+    pub(crate) fn quantize(self, width: usize, precision: Precision) -> Self {
         let bits = match precision {
             Precision::Checkpoint => return self,
             Precision::Int8 | Precision::Int8Compute => 8,
