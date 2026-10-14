@@ -239,3 +239,17 @@ Sources: [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingsta
 [Rust Lambda handlers](https://docs.aws.amazon.com/lambda/latest/dg/rust-handler.html),
 [Strands inference](https://github.com/strands-labs/strands-decider/blob/main/docs/inference.md),
 [Strands architecture](https://github.com/strands-labs/strands-decider/blob/main/docs/architecture.md).
+
+## Request admission
+
+Apply `InferenceLimits::lambda()` through `engine.decide_with_limits(&request,
+&limits)` in each handler. It allows at most three questions, 32 options per
+question, 64 KiB of canonical JSON state, 256 KiB of canonical JSON request,
+2048 bound tokens per question and 4096 tokens in total. These are initial
+admission limits to validate with your workload, not measured Lambda time bounds.
+Each question repeats the state and incurs a separate forward pass. All limits
+are checked before any forward pass, so an invalid final question cannot cause
+earlier questions to execute. Limit raw HTTP/event body size before JSON parsing,
+reuse one loaded engine, serialize inference per execution environment, and set
+`RAYON_NUM_THREADS` explicitly. Larger policies require an explicit
+`InferenceLimits` value; the trained window remains a hard limit.

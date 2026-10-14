@@ -33,6 +33,103 @@ pub(crate) struct Rope {
     pub rope_type: String,
 }
 impl Config {
+    /// Prove products used by all model/kernel allocations before reading any
+    /// payload. Independent projection widths are legal (not necessarily h).
+    pub fn validate_layout(
+        &self,
+        tokens: usize,
+        rank: usize,
+        pointer: usize,
+        limits: &crate::LoadLimits,
+    ) -> Result<(), String> {
+        use crate::loading::{product as mul, sum, within};
+        self.validate()?;
+        let h = self.hidden_size;
+        let qw = mul("query width", &[self.num_attention_heads, self.head_dim])?;
+        let kw = mul(
+            "key/value width",
+            &[self.num_key_value_heads, self.head_dim],
+        )?;
+        let kd = mul(
+            "delta key width",
+            &[self.linear_num_key_heads, self.linear_key_head_dim],
+        )?;
+        let vd = mul(
+            "delta value width",
+            &[self.linear_num_value_heads, self.linear_value_head_dim],
+        )?;
+        let qkv = sum("delta QKV width", &[mul("delta keys", &[2, kd])?, vd])?;
+        let recurrent = mul(
+            "recurrent state",
+            &[
+                self.linear_num_value_heads,
+                self.linear_key_head_dim,
+                self.linear_value_head_dim,
+            ],
+        )?;
+        let mut weights = crate::loading::WeightBudget::new(*limits);
+        weights.charge("embedding", &[self.vocab_size, h])?;
+        weights.charge("final norm", &[h])?;
+        weights.charge("pointer head", &[2, pointer, h])?;
+        weights.charge(
+            "pointer norms/biases",
+            &[2, sum("pointer norms", &[h, pointer])?],
+        )?;
+        let mut max_width = h.max(self.intermediate_size).max(rank).max(pointer);
+        for kind in &self.layer_types {
+            let mut projections = vec![
+                (h, self.intermediate_size),
+                (h, self.intermediate_size),
+                (self.intermediate_size, h),
+            ];
+            weights.charge("layer norms", &[2, h])?;
+            if kind == "full_attention" {
+                projections.extend([
+                    (h, mul("gated query width", &[2, qw])?),
+                    (h, kw),
+                    (h, kw),
+                    (qw, h),
+                ]);
+                weights.charge("attention norms", &[2, self.head_dim])?;
+            } else {
+                projections.extend([
+                    (h, qkv),
+                    (h, vd),
+                    (h, self.linear_num_value_heads),
+                    (h, self.linear_num_value_heads),
+                    (vd, h),
+                ]);
+                weights.charge("convolution", &[qkv, self.linear_conv_kernel_dim])?;
+                weights.charge(
+                    "delta constants",
+                    &[sum(
+                        "delta constants",
+                        &[
+                            mul("delta heads", &[2, self.linear_num_value_heads])?,
+                            self.linear_value_head_dim,
+                        ],
+                    )?],
+                )?;
+            }
+            for (input, output) in projections {
+                weights.charge("projection", &[output, input])?;
+                weights.charge("LoRA A", &[rank, input])?;
+                weights.charge("LoRA B", &[output, rank])?;
+                max_width = max_width.max(input).max(output);
+            }
+        }
+        // A deliberately conservative bound on live activations, projection
+        // columns, LoRA intermediates, quantization buffers and worker scratch.
+        // Attention scores are row-local, never an n*n*heads tensor.
+        let activations = mul("activation workspace", &[tokens, max_width, 16])?;
+        let angles = mul("rotary workspace", &[tokens, self.rotary_dim(), 2])?;
+        let elements = sum("forward workspace", &[activations, angles, recurrent])?;
+        within(
+            "forward workspace",
+            mul("forward workspace", &[elements, 4])?,
+            limits.max_workspace_bytes,
+        )
+    }
     pub fn validate(&self) -> Result<(), String> {
         let dimensions = [
             self.hidden_size,
@@ -66,7 +163,7 @@ impl Config {
                 .linear_num_value_heads
                 .is_multiple_of(self.linear_num_key_heads)
         {
-            return Err("query/value head counts must divide key head counts".into());
+            return Err("key head counts must divide query/value head counts".into());
         }
         let r = self.rotary_dim();
         if !self.rms_norm_eps.is_finite()
@@ -78,6 +175,7 @@ impl Config {
             || !self.rope_parameters.rope_theta.is_finite()
             || self.rope_parameters.rope_theta <= 0.0
             || !self.rope_parameters.partial_rotary_factor.is_finite()
+            || !(0.0..=1.0).contains(&self.rope_parameters.partial_rotary_factor)
             || r == 0
             || r > self.head_dim
             || !r.is_multiple_of(2)
@@ -179,6 +277,8 @@ struct Layer {
     down: Linear,
 }
 pub(crate) struct Model {
+    #[cfg(test)]
+    pub forward_calls: std::sync::atomic::AtomicUsize,
     config: Config,
     embedding: Data,
     layers: Vec<Layer>,
@@ -291,6 +391,8 @@ impl Model {
             Vec::new()
         };
         Ok(Self {
+            #[cfg(test)]
+            forward_calls: std::sync::atomic::AtomicUsize::new(0),
             config: c,
             embedding,
             layers,
@@ -299,11 +401,15 @@ impl Model {
         })
     }
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        if ids.is_empty() {
-            return Err("empty token sequence".into());
+        #[cfg(test)]
+        self.forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if ids.is_empty() || ids.len() > 4096 {
+            return Err("token sequence must contain 1–4096 tokens".into());
         }
         let c = &self.config;
-        let mut x = Vec::with_capacity(ids.len() * c.hidden_size);
+        let size = crate::loading::product("hidden activations", &[ids.len(), c.hidden_size])?;
+        let mut x = Vec::with_capacity(size);
         let mut scratch = Vec::new();
         for id in ids {
             if *id as usize >= c.vocab_size {
@@ -522,6 +628,43 @@ impl Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config() -> Config {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/tiny/base/config.json")).unwrap();
+        serde_json::from_value(v["text_config"].clone()).unwrap()
+    }
+
+    #[test]
+    fn invalid_derived_shapes_fail_before_allocating() {
+        let limits = crate::LoadLimits::default();
+        let mut c = config();
+        c.hidden_size = 1_000_000;
+        c.intermediate_size = 1_000_000;
+        assert!(c
+            .validate_layout(4096, 16, 4, &limits)
+            .unwrap_err()
+            .contains("budget"));
+        let mut c = config();
+        c.linear_num_value_heads = 1_000_000;
+        c.linear_key_head_dim = 1_000_000;
+        c.linear_value_head_dim = 1_000_000;
+        assert!(c.validate_layout(4096, 16, 4, &limits).is_err());
+        let mut c = config();
+        c.num_attention_heads = 3;
+        c.num_key_value_heads = 2;
+        assert!(c.validate().unwrap_err().contains("head counts"));
+        let mut c = config();
+        c.linear_num_value_heads = 3;
+        assert!(c.validate().unwrap_err().contains("head counts"));
+        let mut c = config();
+        c.num_hidden_layers = 1_000_000;
+        c.layer_types = vec!["full_attention".into(); c.num_hidden_layers];
+        assert!(c
+            .validate_layout(4096, 4096, 4, &limits)
+            .unwrap_err()
+            .contains("budget"));
+    }
 
     #[test]
     fn residual_norm_matches_separate_residual_copy_and_normalization() {

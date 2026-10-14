@@ -6,6 +6,8 @@
 #![deny(unsafe_code)]
 
 mod int8;
+mod limits;
+mod loading;
 mod prompt;
 mod qwen;
 pub mod schema;
@@ -13,6 +15,8 @@ mod tensor;
 mod weights;
 
 use crate::tensor::{dot_scores, softmax};
+pub use limits::InferenceLimits;
+pub use loading::LoadLimits;
 pub use schema::{Answer, Question, Request, Response};
 use serde::Deserialize;
 use serde_json::Value;
@@ -121,11 +125,36 @@ pub struct Encoding {
     pub answer_position: usize,
 }
 
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "{}: metadata exceeds {limit} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
 fn json(path: &Path) -> Result<Value, String> {
-    serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
+    serde_json::from_slice(&read_bounded(path, 1024 * 1024)?)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 impl NativeEngine {
+    /// Apply an explicit per-call serving policy. Every question is preflighted
+    /// before any model execution; errors never return partial answers.
+    pub fn decide_with_limits(
+        &self,
+        request: &Request,
+        limits: &InferenceLimits,
+    ) -> Result<Response, String> {
+        self.decide_bounded(request, limits)
+    }
     /// `dir` holds a Strands export and a `base/` directory with Qwen weights.
     pub fn load(dir: &Path) -> Result<Self, String> {
         Self::load_with_precision(dir, Precision::Checkpoint)
@@ -133,6 +162,14 @@ impl NativeEngine {
     /// Groupwise symmetric modes, not GGUF/AWQ formats. `Int8Compute` also
     /// quantizes projection inputs and uses ARM dot products when available.
     pub fn load_with_precision(dir: &Path, precision: Precision) -> Result<Self, String> {
+        Self::load_with_limits(dir, precision, &LoadLimits::default())
+    }
+    /// Load with explicit allocation budgets. This does not sandbox checkpoints.
+    pub fn load_with_limits(
+        dir: &Path,
+        precision: Precision,
+        limits: &LoadLimits,
+    ) -> Result<Self, String> {
         let config_path = if dir.join("strands_decider_config.json").exists() {
             dir.join("strands_decider_config.json")
         } else {
@@ -178,6 +215,10 @@ impl NativeEngine {
             .as_f64()
             .filter(|v| v.is_finite() && *v > 0.0)
             .ok_or("invalid LoRA alpha")? as f32;
+        if !alpha.is_finite() || alpha / rank as f32 == 0.0 {
+            return Err("LoRA alpha is not representable as positive finite FP32".into());
+        }
+        cfg.validate_layout(config.max_length, rank, config.pointer_dim, limits)?;
         if a["peft_type"] != "LORA"
             || a["bias"] != "none"
             || a["use_dora"].as_bool().unwrap_or(false)
@@ -193,21 +234,29 @@ impl NativeEngine {
         {
             return Err("unsupported LoRA adapter configuration".into());
         }
-        let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| format!("tokenizer: {e}"))?;
+        let mut tokenizer = tokenizers::Tokenizer::from_bytes(read_bounded(
+            &dir.join("tokenizer.json"),
+            64 * 1024 * 1024,
+        )?)
+        .map_err(|e| format!("tokenizer: {e}"))?;
         tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
         tokenizer.with_padding(None);
-        let mut adapter = Weights::file(&dir.join("lora/adapter_model.safetensors"), None)?;
+        let mut budget = loading::WeightBudget::new(*limits);
+        let mut adapter = Weights::file_bounded(
+            &dir.join("lora/adapter_model.safetensors"),
+            None,
+            &mut budget,
+        )?;
         if adapter.remaining() == 0 {
             return Err("empty LoRA adapter".into());
         }
         let head = Head::load(
-            Weights::file(&dir.join("head.safetensors"), None)?,
+            Weights::file_bounded(&dir.join("head.safetensors"), None, &mut budget)?,
             cfg.hidden_size,
             config.pointer_dim,
         )?;
         let model = qwen::Model::load(
-            Weights::base(&dir.join("base"), precision)?,
+            Weights::base(&dir.join("base"), precision, &mut budget)?,
             &mut adapter,
             cfg,
             rank,
@@ -289,7 +338,17 @@ impl DecisionEngine for NativeEngine {
         self.precision.engine_id()
     }
     fn decide(&self, request: &Request) -> Result<Response, String> {
-        request.validate()?;
+        self.decide_bounded(request, &InferenceLimits::default())
+    }
+}
+
+impl NativeEngine {
+    fn decide_bounded(
+        &self,
+        request: &Request,
+        limits: &InferenceLimits,
+    ) -> Result<Response, String> {
+        limits.validate(request)?;
         if request.model.as_deref().is_some_and(|m| {
             m != self.model()
                 && m != ENGINE_ID
@@ -299,6 +358,7 @@ impl DecisionEngine for NativeEngine {
             return Err("requested model is not this native engine".into());
         }
         // Validate and bind every question before spending CPU on any of them.
+        let mut total_tokens = 0;
         let encoded: Vec<_> = request
             .questions
             .iter()
@@ -308,8 +368,9 @@ impl DecisionEngine for NativeEngine {
                     &self.tokenizer,
                     &request.state,
                     &rendered,
-                    self.max_length(),
+                    self.max_length().min(limits.max_question_tokens),
                 )?;
+                total_tokens = limits.add_tokens(total_tokens, enc.input_ids.len())?;
                 Ok((name, q, rendered, enc))
             })
             .collect::<Result<_, String>>()?;
@@ -350,6 +411,39 @@ impl DecisionEngine for NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_or_aggregate_rejection_never_starts_a_forward_pass() {
+        let e = NativeEngine::load(&fixture()).unwrap();
+        let mut request: Request =
+            serde_json::from_str(include_str!("../tests/request.json")).unwrap();
+        let total = e
+            .encode(&request.state, request.questions.values().next().unwrap())
+            .unwrap()
+            .input_ids
+            .len();
+        let limits = InferenceLimits {
+            max_total_tokens: total,
+            ..InferenceLimits::default()
+        };
+        assert!(e
+            .decide_with_limits(&request, &limits)
+            .unwrap_err()
+            .contains("total tokens"));
+        request.questions.insert(
+            "zz_last".into(),
+            Question::Noul {
+                instructions: Value::String("too long ".repeat(300)),
+                criteria: None,
+            },
+        );
+        assert!(e.decide(&request).unwrap_err().contains("context window"));
+        assert_eq!(
+            e.model
+                .forward_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
     }

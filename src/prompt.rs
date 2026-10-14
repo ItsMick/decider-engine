@@ -125,3 +125,31 @@ impl Rendered {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn delimiter_looking_content_cannot_redefine_option_spans_or_order() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/adversarial.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let request: crate::Request = serde_json::from_value(case["request"].clone()).unwrap();
+            let q = &request.questions["decision"];
+            let rendered = render(q);
+            let labels: Vec<String> = match q {
+                Question::Noul { .. } => vec!["false".into(), "true".into()],
+                Question::Choice { criteria, .. } => criteria.keys().cloned().collect(),
+                Question::Score { criteria, .. } => {
+                    (0..criteria.len()).map(|i| i.to_string()).collect()
+                }
+            };
+            assert_eq!(rendered.labels, labels);
+            assert_eq!(rendered.spans.len(), labels.len());
+            for (i, ((start, end), label)) in rendered.spans.iter().zip(labels).enumerate() {
+                assert!(rendered.text[*start..*end].starts_with(&format!("{}. {label}", i + 1)));
+            }
+            assert!(rendered.spans.windows(2).all(|p| p[0].1 < p[1].0));
+        }
+    }
+}

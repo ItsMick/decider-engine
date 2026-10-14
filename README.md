@@ -78,8 +78,54 @@ Text only, CPU only, no generation or prefix/KV cache. Each
 question gets a separate forward pass. Prompts exceeding the checkpoint's
 4096-token window are rejected without truncation. Use trusted checkpoints;
 the loader validates tensor shapes and uses safetensors, but does not sandbox
-malicious files or enforce a process memory/time budget. Library callers should
-bound request sizes and question counts. Decisions and confidence can be wrong.
+malicious files or enforce a process memory/time budget. Library inference and
+model loading enforce configurable allocation/work budgets described below.
+Decisions and confidence can be wrong.
+
+### Serving and loading budgets
+
+`decide()` applies `InferenceLimits::default()` before prompt rendering and
+tokenization, then checks every bound prompt before any forward pass. An error
+rejects the whole request. Question tokens include the repeated state and template;
+the sum limits aggregate work across separate forward passes.
+
+| Budget | Default | `InferenceLimits::lambda()` |
+| --- | ---: | ---: |
+| Request bytes | 2 MiB | 256 KiB |
+| State bytes | 256 KiB | 64 KiB |
+| Questions | 16 | 3 |
+| Options per question | 255 | 32 |
+| Tokens per question | 4096 | 2048 |
+| Total tokens | 8192 | 4096 |
+
+Bytes count canonical pretty-printed JSON, including escaping and keys, using
+a bounded counting writer without allocating a serialized copy. Content nesting
+is limited to 64. The CLI additionally bounds raw input to 2 MiB. Hosts must bound
+wire bodies before deserialization, concurrency, invocation time, and Rayon workers.
+The Lambda policy is a starting point to benchmark, not a latency guarantee.
+
+```rust,ignore
+let limits = decider_engine::InferenceLimits::lambda();
+let response = engine.decide_with_limits(&request, &limits)?;
+```
+
+Trusted callers can construct a larger `InferenceLimits` explicitly. The model's
+trained token window and schema constraints still apply. `encode` and `raw_logits`
+are diagnostic APIs for trusted inputs; they are not a hosted request boundary.
+
+`load_with_limits(path, precision, &LoadLimits)` also permits explicit budgets.
+Defaults are 2 GiB per FP32-equivalent tensor, 12 GiB for FP32-equivalent aggregate
+weights, possible group scales, and conversion scratch, and 2 GiB for estimated forward workspace at the
+checkpoint's maximum window. Checked arithmetic covers embeddings, projections,
+LoRA, pointer weights, rotary buffers, activations, and recurrent state. Every
+selected safetensors shape is charged before payload reads, across all shards,
+including extra tensors that will later be rejected. JSON config/index files are
+limited to 1 MiB, tokenizer input to 64 MiB, and safetensors headers to 16 MiB.
+
+These conservative estimates deliberately overcount packed weights. They are
+neither available-RAM detection nor an RSS cap: tokenizer allocations, metadata,
+allocator overhead, worker stacks, and simultaneous requests require additional
+headroom. Set budgets for your host and use trusted checkpoint files.
 
 ```sh
 cargo test --locked
@@ -93,6 +139,9 @@ PyTorch reference, and check causal isolation and invalid inputs. The optional
 full-weight test compares three questions against the pinned v21 reference;
 this is a parity check, not a benchmark of decision quality.
 See [fixture provenance](tests/fixtures/README.md).
+See [validation procedures and semantic trust limits](docs/validation.md) for the
+opt-in checkpoint workflow, adversarial suite, precision smoke evaluation, and
+remaining release/deployment evidence.
 Rayon controls parallelism through its standard `RAYON_NUM_THREADS` setting.
 The forward pass precomputes RoPE frequencies and constant decay rates at load,
 shares rotary sine/cosine values across heads and layers within each request,

@@ -1,0 +1,52 @@
+name: Pinned checkpoint parity
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  parity:
+    name: v21 checkpoint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RAYON_NUM_THREADS: '4'
+      DECIDER_TEST_MODEL_DIR: models/v21
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.0'
+      - uses: Swatinem/rust-cache@v2
+      - name: Acquire pinned, hash-verified weights and licenses
+        run: python3 scripts/download-model.py models/v21
+      - name: Record machine, toolchain, source, and checkpoint revisions
+        run: |
+          mkdir -p validation
+          {
+            uname -a
+            lscpu
+            rustc -Vv
+            cargo -V
+            git rev-parse HEAD
+            cat models/v21/revisions.json
+            sha256sum tests/fixtures/v21-reference.json
+            echo "RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
+          } > validation/environment.txt
+      - name: Required checkpoint-precision reference parity
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test model -- --ignored --nocapture 2>&1 | tee validation/parity.log
+      - name: Preserve validation evidence (no weights)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v21-parity-${{ matrix.os }}
+          path: validation/
+          retention-days: 30
