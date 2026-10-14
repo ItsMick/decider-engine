@@ -1,6 +1,6 @@
 //! Text-only Qwen3.5: full causal GQA and recurrent Gated DeltaNet.
 //! FP32 arithmetic matches the upstream CPU serving path. No generation or KV cache.
-use crate::tensor::{dot_scores, softmax, Epilogue};
+use crate::tensor::{dot_scores, softmax, Epilogue, SharedInput};
 use crate::weights::{Data, Linear, Weights};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -484,8 +484,12 @@ impl Model {
                 captured.push(cache);
             }
             residual_norm(&mut x, &mixed, &mut n, &layer.post_norm, c.rms_norm_eps);
-            let mut gate = layer.gate.apply(&n);
-            layer.up.apply_into(&n, &mut gate, Epilogue::SwiGlu);
+            // Gate and up read the same activations; INT8 compute quantizes them once.
+            let input = SharedInput::new(&n, c.hidden_size);
+            let mut gate = layer.gate.apply_shared(&input);
+            layer
+                .up
+                .apply_into_shared(&input, &mut gate, Epilogue::SwiGlu);
             layer.down.apply_into(&gate, &mut x, Epilogue::Add);
         }
         rms(&mut x, &self.norm, c.rms_norm_eps, true);
@@ -534,7 +538,8 @@ impl Full {
         let d = c.head_dim;
         let qw = c.num_attention_heads * d;
         let kw = c.num_key_value_heads * d;
-        let raw_q = self.q.apply(x);
+        let input = SharedInput::new(x, c.hidden_size);
+        let raw_q = self.q.apply_shared(&input);
         let mut q = vec![0.0; n * qw];
         let mut gate = q.clone();
         for t in 0..n {
@@ -545,8 +550,8 @@ impl Full {
                 gate[dst..dst + d].copy_from_slice(&raw_q[src + d..src + 2 * d]);
             }
         }
-        let mut k = self.k.apply(x);
-        let v = self.v.apply(x);
+        let mut k = self.k.apply_shared(&input);
+        let v = self.v.apply_shared(&input);
         rms(&mut q, &self.q_norm, c.rms_norm_eps, true);
         rms(&mut k, &self.k_norm, c.rms_norm_eps, true);
         let half = c.rotary_dim() / 2;
@@ -654,10 +659,11 @@ impl Delta {
         let kd = c.linear_num_key_heads * dk;
         let vd = c.linear_num_value_heads * dv;
         let width = 2 * kd + vd;
-        let raw = self.qkv.apply(x);
-        let z = self.z.apply(x);
-        let a = self.a.apply(x);
-        let b = self.b.apply(x);
+        let input = SharedInput::new(x, c.hidden_size);
+        let raw = self.qkv.apply_shared(&input);
+        let z = self.z.apply_shared(&input);
+        let a = self.a.apply_shared(&input);
+        let b = self.b.apply_shared(&input);
         let kernel = c.linear_conv_kernel_dim;
         let tail = past.map_or(&[][..], |(tail, _)| tail);
         let tail_rows = tail.len() / width;

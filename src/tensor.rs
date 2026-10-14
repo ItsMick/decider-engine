@@ -128,6 +128,17 @@ impl Projection<'_> {
     /// Base and LoRA share the final write, which may add a residual or
     /// consume an existing gate. Larger batches retain separate dot passes.
     pub(crate) fn apply(&self, x: &[f32], result: &mut [f32], epilogue: Epilogue) {
+        self.apply_quantized(x, None, result, epilogue);
+    }
+
+    /// `apply` with `x` already quantized for INT8 computation, when available.
+    pub(crate) fn apply_quantized(
+        &self,
+        x: &[f32],
+        quantized: Option<&QuantizedInputs>,
+        result: &mut [f32],
+        epilogue: Epilogue,
+    ) {
         let (input, output) = (self.input, self.output);
         let rows = x.len() / input;
         assert_eq!(x.len(), rows * input);
@@ -149,7 +160,7 @@ impl Projection<'_> {
                 bias: self.bias,
                 adapter: None,
             }
-            .columns(x);
+            .columns_quantized(x, quantized);
             let delta = Projection {
                 input: adapter.rank,
                 output,
@@ -167,19 +178,23 @@ impl Projection<'_> {
                 epilogue,
             );
         } else {
-            let columns = self.columns(x);
+            let columns = self.columns_quantized(x, quantized);
             write_columns(&columns, None, rows, output, result, epilogue);
         }
     }
 
     fn columns(&self, x: &[f32]) -> Vec<f32> {
+        self.columns_quantized(x, None)
+    }
+
+    fn columns_quantized(&self, x: &[f32], quantized: Option<&QuantizedInputs>) -> Vec<f32> {
         if let Data::Quantized {
             bits: 8,
             compute_int8: true,
             ..
         } = self.weights
         {
-            if let Some(columns) = linear_int8(x, self) {
+            if let Some(columns) = linear_int8(x, self, quantized) {
                 return columns;
             }
         }
@@ -292,42 +307,80 @@ pub(crate) fn linear(
     .apply(x, result, Epilogue::Write);
 }
 
-struct QuantizedInputs {
+pub(crate) struct QuantizedInputs {
     values: Vec<i8>,
     scales: Vec<f32>,
 }
 impl QuantizedInputs {
-    fn new(x: &[f32], width: usize) -> Option<Self> {
+    pub(crate) fn new(x: &[f32], width: usize) -> Option<Self> {
         // Preserve FP32 propagation for non-finite inputs rather than silently
         // turning NaNs or infinities into integer zeroes or saturated values.
         if !x.iter().all(|v| v.is_finite()) {
             return None;
         }
+        let groups = width.div_ceil(64);
+        let rows = x.len() / width;
         let mut result = Self {
-            values: Vec::with_capacity(x.len()),
-            scales: Vec::with_capacity(x.len() / width * width.div_ceil(64)),
+            values: vec![0; x.len()],
+            scales: vec![0.0; rows * groups],
         };
-        for row in x.chunks(width) {
-            for group in row.chunks(64) {
+        // Rows are quantized independently, so they can run in parallel.
+        let quantize = |((row, values), scales): ((&[f32], &mut [i8]), &mut [f32])| {
+            for ((group, values), scale) in row.chunks(64).zip(values.chunks_mut(64)).zip(scales) {
                 let max = group.iter().map(|v| v.abs()).fold(0.0, f32::max);
-                let scale = if max == 0.0 {
+                *scale = if max == 0.0 {
                     1.0
                 } else {
                     (max / 127.0).max(f32::MIN_POSITIVE)
                 };
-                result.scales.push(scale);
-                result.values.extend(
-                    group
-                        .iter()
-                        .map(|v| (v / scale).round().clamp(-127.0, 127.0) as i8),
-                );
+                for (q, v) in values.iter_mut().zip(group) {
+                    *q = (v / *scale).round().clamp(-127.0, 127.0) as i8;
+                }
             }
+        };
+        if x.len() >= 1 << 16 && rayon::current_num_threads() > 1 {
+            x.par_chunks(width)
+                .zip(result.values.par_chunks_mut(width))
+                .zip(result.scales.par_chunks_mut(groups))
+                .for_each(quantize);
+        } else {
+            x.chunks(width)
+                .zip(result.values.chunks_mut(width))
+                .zip(result.scales.chunks_mut(groups))
+                .for_each(quantize);
         }
         Some(result)
     }
 }
 
-fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
+/// An activation read by several projections. Its INT8 quantization for
+/// `int8-compute` is made once, on first use, and shared by them all.
+pub(crate) struct SharedInput<'a> {
+    pub x: &'a [f32],
+    width: usize,
+    quantized: std::cell::OnceCell<Option<QuantizedInputs>>,
+}
+impl<'a> SharedInput<'a> {
+    pub(crate) fn new(x: &'a [f32], width: usize) -> Self {
+        Self {
+            x,
+            width,
+            quantized: std::cell::OnceCell::new(),
+        }
+    }
+    /// `None` when the input has non-finite values and must stay FP32.
+    pub(crate) fn quantized(&self) -> Option<&QuantizedInputs> {
+        self.quantized
+            .get_or_init(|| QuantizedInputs::new(self.x, self.width))
+            .as_ref()
+    }
+}
+
+fn linear_int8(
+    x: &[f32],
+    projection: &Projection<'_>,
+    quantized: Option<&QuantizedInputs>,
+) -> Option<Vec<f32>> {
     let (input, output) = (projection.input, projection.output);
     let rows = x.len() / input;
     let Data::Quantized {
@@ -341,12 +394,22 @@ fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
         unreachable!("integer projection requires INT8 weights");
     };
     assert_eq!(*width, input);
-    let inputs = QuantizedInputs::new(x, input)?;
+    let owned;
+    let inputs = match quantized {
+        Some(shared) => {
+            assert_eq!(shared.values.len(), x.len());
+            shared
+        }
+        None => {
+            owned = QuantizedInputs::new(x, input)?;
+            &owned
+        }
+    };
     let groups = input.div_ceil(64);
     let kernel = Kernel::detect();
     if kernel.tiles(input) {
         return Some(linear_int8_tiled(
-            &inputs, projection, values, scales, &kernel,
+            inputs, projection, values, scales, &kernel,
         ));
     }
     let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
@@ -665,6 +728,40 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn parallel_input_quantization_matches_serial_exactly() {
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|t| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(t)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        // Above and below the parallel threshold, with a partial last group.
+        for (rows, width) in [(3, 100), (70, 1000), (40, 2048)] {
+            let x: Vec<f32> = (0..rows * width)
+                .map(|i| match i % 17 {
+                    0 => 0.0,
+                    1 => -1e-38,
+                    k => ((i * 31 % 499) as f32 - 249.0) / k as f32,
+                })
+                .collect();
+            let results: Vec<_> = pools
+                .iter()
+                .map(|p| p.install(|| QuantizedInputs::new(&x, width).unwrap()))
+                .collect();
+            assert_eq!(results[0].values, results[1].values);
+            assert!(results[0]
+                .scales
+                .iter()
+                .zip(&results[1].scales)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert_eq!(results[0].scales.len(), rows * width.div_ceil(64));
         }
     }
 

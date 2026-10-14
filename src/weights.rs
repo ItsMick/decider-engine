@@ -1,5 +1,5 @@
 //! Validated F32/BF16/F16 safetensors; no pickle or model code execution.
-use crate::tensor::{linear, Adapter, Epilogue, Projection};
+use crate::tensor::{linear, Adapter, Epilogue, Projection, SharedInput};
 use crate::Precision;
 use safetensors::{tensor::Metadata, Dtype};
 use std::{
@@ -431,12 +431,20 @@ impl Linear {
         Ok(())
     }
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
-        let rows = x.len() / self.input;
-        let mut out = vec![0.0; rows * self.output];
-        self.apply_into(x, &mut out, Epilogue::Write);
-        out
+        self.apply_shared(&SharedInput::new(x, self.input))
     }
     pub fn apply_into(&self, x: &[f32], out: &mut [f32], epilogue: Epilogue) {
+        self.apply_into_shared(&SharedInput::new(x, self.input), out, epilogue);
+    }
+    /// `apply` for an input that other projections also read.
+    pub fn apply_shared(&self, input: &SharedInput<'_>) -> Vec<f32> {
+        let rows = input.x.len() / self.input;
+        let mut out = vec![0.0; rows * self.output];
+        self.apply_into_shared(input, &mut out, Epilogue::Write);
+        out
+    }
+    pub fn apply_into_shared(&self, input: &SharedInput<'_>, out: &mut [f32], epilogue: Epilogue) {
+        let x = input.x;
         // Keep the measured scalar INT8 fallback's separate execution plan.
         // Native ARM dot products and FP32 modes use the fused output path.
         if matches!(
@@ -495,6 +503,13 @@ impl Linear {
         } else {
             None
         };
+        // Only INT8-compute weights consume the shared quantization.
+        let quantized = match self.w {
+            Data::Quantized {
+                compute_int8: true, ..
+            } => input.quantized(),
+            _ => None,
+        };
         Projection {
             input: self.input,
             output: self.output,
@@ -502,7 +517,7 @@ impl Linear {
             bias: self.bias.as_deref(),
             adapter,
         }
-        .apply(x, out, epilogue);
+        .apply_quantized(x, quantized, out, epilogue);
     }
 }
 
@@ -689,6 +704,40 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn shared_input_quantization_matches_per_projection_quantization() {
+        let (input, rank) = (128, 4);
+        let layers: Vec<Linear> = [(31, 1), (8, 2), (64, 3)]
+            .into_iter()
+            .map(|(output, seed)| {
+                Linear::synthetic(input, output, rank, seed, Precision::Int8Compute)
+            })
+            .collect();
+        for rows in [1, 5, 70] {
+            let mut x: Vec<f32> = (0..rows * input)
+                .map(|i| ((i * 43 % 113) as f32 - 56.0) / 16.0)
+                .collect();
+            for finite in [true, false] {
+                if !finite {
+                    // Non-finite inputs keep the FP32 fallback either way.
+                    x[input / 2] = f32::NAN;
+                }
+                let shared = SharedInput::new(&x, input);
+                for layer in &layers {
+                    let separate = layer.apply(&x);
+                    let together = layer.apply_shared(&shared);
+                    assert!(
+                        separate
+                            .iter()
+                            .zip(&together)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "rows {rows}, finite {finite}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn half_and_bfloat_readout() {
         assert_eq!(
