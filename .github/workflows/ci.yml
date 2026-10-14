@@ -33,6 +33,26 @@ jobs:
       - run: cargo test --locked
         env:
           DECIDER_REQUIRE_DOTPROD: ${{ (matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest') && '1' || '0' }}
+      - name: Pinned v21 prompt binding (tokenizer only, no weights)
+        shell: bash
+        run: |
+          mkdir -p encoder
+          base=https://huggingface.co/StrandsAgents/strands-decider-2B-hobson-v21/resolve/2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5
+          for name in tokenizer.json strands_decider_config.json; do
+            curl -fsSL --retry 3 -o "encoder/$name" "$base/$name"
+          done
+          python3 - <<'EOF'
+          import hashlib
+          from pathlib import Path
+          pinned = {
+              "tokenizer.json": "a2cdd2e108566b09079afa8d266e9e65e7c280f27b771218237a06de5ba9cd86",
+              "strands_decider_config.json": "9b660cabb91ab9683dd62dee83e00a5ca30dff8657489e6ce473136f8d9eb529",
+          }
+          for name, digest in pinned.items():
+              if hashlib.sha256(Path("encoder", name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit(f"{name}: unexpected SHA256")
+          EOF
+          DECIDER_TEST_ENCODER_DIR=encoder cargo test --locked --test encoding -- --ignored
       - name: Measure synthetic ARM projections
         if: matrix.os == 'ubuntu-24.04-arm'
         env:

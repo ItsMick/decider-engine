@@ -101,6 +101,10 @@ match engine.evaluate(request, &InferenceLimits::lambda()) {
 # }
 ```
 
+`Encoder::load(dir)` binds prompts with only the checkpoint's config and
+`tokenizer.json`, producing the same token IDs and option positions as
+`NativeEngine::encode`. Use it to check prompt lengths before forwarding.
+
 For a Git dependency:
 
 ```toml

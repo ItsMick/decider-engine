@@ -73,3 +73,32 @@ job. The generator rejects changed source hashes, revisions or core package
 versions. Run on CPU with about 8 GiB available memory; generation and the native
 4,096-token forward can take minutes. The independent Python dependencies do not
 enter the engine, its release package, or normal CI.
+
+## v21 prompt-binding oracle
+
+`v21-encoding-reference.json` holds token IDs, option positions and answer
+positions only, for cases chosen to stress rendering and the mapping from
+upstream's character offsets to this crate's byte offsets:
+- structured state with Python-formatted floats,
+- non-ASCII, CJK, right-to-left and emoji labels,
+- descriptions ending in punctuation, and null or whitespace-only descriptions,
+- 2- and 10-level scores and a 255-option choice,
+- CRLF line endings and U+001C–U+001F separators,
+- delimiter-looking state text,
+- a long CJK state, and one request over the 4,096-token window, which must be
+  rejected.
+
+`scripts/generate-encoding-reference.py` produces it with upstream `prompting.py`
+and `schema.py`, the Transformers fast tokenizer, upstream's strict-window rule and
+its last-token-in-span readout. It needs no model weights or torch, only the
+pinned `tokenizer.json`, and it checks the same Strands commit, source hashes,
+revisions and package versions as the full-weight generator. Its binding
+reproduces every encoding in the two full-weight references exactly.
+
+Default CI fetches the pinned `tokenizer.json` and `strands_decider_config.json`,
+verifies their SHA256s, and runs `tests/encoding.rs` against this fixture on every
+platform:
+
+```sh
+DECIDER_TEST_ENCODER_DIR=models/v21 cargo test --locked --test encoding -- --ignored
+```
