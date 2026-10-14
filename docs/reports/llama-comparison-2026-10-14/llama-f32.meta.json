@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/tmp/llama-compare",
+    "/tmp/decider-base-f32.gguf",
+    "/tmp/decider-lora.gguf",
+    "/tmp/comparison/head.json",
+    "/tmp/comparison/cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 75.557674357,
+  "peak_rss_kib": 7786036
+}
