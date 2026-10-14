@@ -35,6 +35,16 @@ For an F32 comparison, change the base converter's `--outtype` to `f32` and use 
 
 The runner writes complete JSONL samples, process metadata and a summary. It refuses to overwrite an existing output directory. Compare logits with the independent reference as well as between engines; a faster run that misses the numerical gate is not strict correctness parity. The calibrated probability differences are computed with the pinned per-kind temperatures. Argmax equality alone is not calibration validation.
 
+## Cache-blocking experiment on ARM64
+
+The `cache-blocking` feature is opt-in. For projections with at least 64 rows, 256 input columns and 24 output columns, it computes a 24-row activation block against 24 output columns before advancing to the next row block. It keeps each original dot product's arithmetic order. The INT8-compute kernel, small projections and default build keep their existing selection.
+
+The converted weight block needs at most `24 * input_width * 4` bytes per active worker, with reusable worker scratch. This increases temporary conversion storage compared with the original one/three-column tasks, while avoiding a full-model FP32 weight expansion. The sweep compares several row/column block sizes to expose shape-dependent regressions.
+
+The **Matched CPU performance** workflow runs the experiment on `ubuntu-24.04-arm`. It compares a pinned main source revision, the candidate feature and pinned llama.cpp, serially, with the same four reference probes. Both native builds target Neoverse N1; llama's CPU build uses ARMv8.2+FP16+dotprod, tuned for Neoverse N1, without newer BF16/I8MM/SVE instructions. This restricts the instruction set but does not emulate Graviton2's cache, clock or memory system.
+
+The workflow retains JSONL samples, process RSS, build/conversion logs, source/model hashes, summaries and a block-size sweep as a 30-day artifact. Native baseline and candidate logits must be identical and within the independent `1e-4` logit tolerance; performance results do not waive correctness. The feature should remain opt-in unless full-model measurements justify a default change. These measurements do not authorize or require an AWS deployment.
+
 ## Limits
 
 - Four cases: three short prompts (choice, noul, score) and one 1,024-token prompt. This is not representative deployment traffic.

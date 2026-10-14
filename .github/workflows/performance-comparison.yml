@@ -28,6 +28,8 @@ jobs:
         with:
           toolchain: '1.98.0'
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cache-on-failure: true
       - name: Install conversion and build dependencies
         run: |
           python3 -m venv /tmp/comparison-python
@@ -54,7 +56,7 @@ jobs:
           cp target/release/examples/compare_logits /tmp/decider-blocked
       - name: Build llama CPU and convert exact pinned weights
         run: |
-          cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
+          cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod -DCMAKE_C_FLAGS=-mtune=neoverse-n1 -DCMAKE_CXX_FLAGS=-mtune=neoverse-n1 -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
           cmake --build /tmp/llama.cpp/build --target llama -j 4
           g++ -O3 -std=c++17 -I /tmp/llama.cpp/include -I /tmp/llama.cpp/ggml/include -I /tmp/llama.cpp/vendor scripts/llama-compare.cpp -L /tmp/llama.cpp/build/bin -Wl,-rpath,/tmp/llama.cpp/build/bin -lllama -lggml -lggml-base -o /tmp/llama-compare
           cp models/v21/tokenizer*.json models/v21/base/
@@ -72,7 +74,13 @@ jobs:
             git -C /tmp/native-baseline rev-parse HEAD
             git -C /tmp/llama.cpp rev-parse HEAD
             cat models/v21/revisions.json
-            cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max
+            for path in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+              if [ -r "$path" ]; then
+                printf '%s=' "$path"
+                cat "$path"
+              fi
+            done
+            free -h
             python3 -m pip freeze
             sha256sum /tmp/base-bf16.gguf /tmp/lora-f32.gguf /tmp/prepared/cases.json scripts/llama-compare.cpp
             grep -E 'GGML_NATIVE:|GGML_CPU_ARM_ARCH:' /tmp/llama.cpp/build/CMakeCache.txt
@@ -96,6 +104,16 @@ jobs:
           cat validation/blocked-vs-llama.json
       - name: Projection cache-blocking sweep
         run: cargo test --release --locked --lib benchmark_projection_blocking -- --ignored --nocapture > validation/blocking-sweep.log 2>&1
+      - name: Print measurement evidence for text-only review
+        if: always()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for path in sorted(Path('validation').glob('*')):
+              if path.suffix in ('.json', '.jsonl') or path.name in ('environment.txt', 'blocking-sweep.log'):
+                  print(path.name)
+                  print(path.read_text())
+          PY
       - name: Preserve evidence without weights
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
