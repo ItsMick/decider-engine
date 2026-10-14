@@ -184,6 +184,86 @@ fn json(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&read_bounded(path, 1024 * 1024)?)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
+/// `strands_decider_config.json` (or the older `hobson_config.json`), validated.
+fn read_config(dir: &Path) -> Result<DeciderConfig, String> {
+    let config_path = if dir.join("strands_decider_config.json").exists() {
+        dir.join("strands_decider_config.json")
+    } else {
+        dir.join("hobson_config.json")
+    };
+    let config: DeciderConfig =
+        serde_json::from_value(json(&config_path)?).map_err(|e| e.to_string())?;
+    if config.base_model != "Qwen/Qwen3.5-2B-Base"
+        || config.head_type != "pointer"
+        || !config.use_lora
+        || config.force_bos
+    {
+        return Err(
+            "native engine requires Qwen3.5-2B-Base, pointer head, LoRA, and default BOS behavior"
+                .into(),
+        );
+    }
+    if config.max_length == 0
+        || config.max_length > 4096
+        || config.pointer_dim == 0
+        || config.pointer_dim > 4096
+        || !config.temperature.is_finite()
+        || config.temperature <= 0.0
+        || config
+            .temperature_by_kind
+            .values()
+            .any(|t| !t.is_finite() || *t <= 0.0)
+        || !config.ordinal_smoothing.is_finite()
+        || !(0.0..=1.0).contains(&config.ordinal_smoothing)
+    {
+        return Err("invalid decision window, pointer dimension, or calibration".into());
+    }
+    Ok(config)
+}
+
+fn load_tokenizer(dir: &Path) -> Result<tokenizers::Tokenizer, String> {
+    let mut tokenizer = tokenizers::Tokenizer::from_bytes(read_bounded(
+        &dir.join("tokenizer.json"),
+        64 * 1024 * 1024,
+    )?)
+    .map_err(|e| format!("tokenizer: {e}"))?;
+    tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
+    tokenizer.with_padding(None);
+    Ok(tokenizer)
+}
+
+/// Prompt binding without model weights: a checkpoint's tokenizer and context
+/// window, read from the same directory layout as `NativeEngine::load`.
+/// Produces exactly the encodings `NativeEngine::encode` would.
+pub struct Encoder {
+    tokenizer: tokenizers::Tokenizer,
+    max_length: usize,
+}
+
+impl Encoder {
+    /// Reads only `strands_decider_config.json` and `tokenizer.json` from `dir`.
+    pub fn load(dir: &Path) -> Result<Self, String> {
+        let config = read_config(dir)?;
+        Ok(Self {
+            tokenizer: load_tokenizer(dir)?,
+            max_length: config.max_length,
+        })
+    }
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+    /// Token IDs and option positions for one question over `state`.
+    pub fn encode(&self, state: &Value, question: &Question) -> Result<Encoding, DecideError> {
+        schema::content(state, false)
+            .map_err(|e| DecideError::new(ErrorKind::InvalidRequest, e))?;
+        question
+            .validate()
+            .map_err(|e| DecideError::new(ErrorKind::InvalidRequest, e))?;
+        let rendered = prompt::render(question);
+        Ok(encode(&self.tokenizer, state, &rendered, self.max_length)?.0)
+    }
+}
+
 impl NativeEngine {
     /// Apply an explicit per-call serving policy. Every question is preflighted
     /// before any model execution; errors never return partial answers.
@@ -209,35 +289,7 @@ impl NativeEngine {
         precision: Precision,
         limits: &LoadLimits,
     ) -> Result<Self, String> {
-        let config_path = if dir.join("strands_decider_config.json").exists() {
-            dir.join("strands_decider_config.json")
-        } else {
-            dir.join("hobson_config.json")
-        };
-        let config: DeciderConfig =
-            serde_json::from_value(json(&config_path)?).map_err(|e| e.to_string())?;
-        if config.base_model != "Qwen/Qwen3.5-2B-Base"
-            || config.head_type != "pointer"
-            || !config.use_lora
-            || config.force_bos
-        {
-            return Err("native engine requires Qwen3.5-2B-Base, pointer head, LoRA, and default BOS behavior".into());
-        }
-        if config.max_length == 0
-            || config.max_length > 4096
-            || config.pointer_dim == 0
-            || config.pointer_dim > 4096
-            || !config.temperature.is_finite()
-            || config.temperature <= 0.0
-            || config
-                .temperature_by_kind
-                .values()
-                .any(|t| !t.is_finite() || *t <= 0.0)
-            || !config.ordinal_smoothing.is_finite()
-            || !(0.0..=1.0).contains(&config.ordinal_smoothing)
-        {
-            return Err("invalid decision window, pointer dimension, or calibration".into());
-        }
+        let config = read_config(dir)?;
         let base = json(&dir.join("base/config.json"))?;
         if base["model_type"] != "qwen3_5" {
             return Err("base model must be qwen3_5".into());
@@ -273,13 +325,7 @@ impl NativeEngine {
         {
             return Err("unsupported LoRA adapter configuration".into());
         }
-        let mut tokenizer = tokenizers::Tokenizer::from_bytes(read_bounded(
-            &dir.join("tokenizer.json"),
-            64 * 1024 * 1024,
-        )?)
-        .map_err(|e| format!("tokenizer: {e}"))?;
-        tokenizer.with_truncation(None).map_err(|e| e.to_string())?;
-        tokenizer.with_padding(None);
+        let tokenizer = load_tokenizer(dir)?;
         let mut budget = loading::WeightBudget::new(*limits);
         let mut adapter = Weights::file_bounded(
             &dir.join("lora/adapter_model.safetensors"),
