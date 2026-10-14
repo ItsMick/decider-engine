@@ -1,5 +1,6 @@
 /target/
 /models/
+__pycache__/
 *.part
 .env
 .env.*

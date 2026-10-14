@@ -1,0 +1,379 @@
+{
+  "suite_version": 1,
+  "precision": "int8",
+  "architecture": "x86_64",
+  "rayon_workers": 4,
+  "load_ms": 7850.985262,
+  "cases": [
+    {
+      "id": "invoice-baseline",
+      "bindings": {
+        "decision": {
+          "tokens": 100,
+          "option_positions": [
+            76,
+            87
+          ],
+          "answer_position": 99
+        }
+      },
+      "elapsed_ms": 5190.195162,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.07649862766265869
+          }
+        },
+        "usage": {
+          "input_tokens": 100,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "close-state",
+      "bindings": {
+        "decision": {
+          "tokens": 123,
+          "option_positions": [
+            99,
+            110
+          ],
+          "answer_position": 122
+        }
+      },
+      "elapsed_ms": 6412.455446,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.09964350610971451
+          }
+        },
+        "usage": {
+          "input_tokens": 123,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "fake-options",
+      "bindings": {
+        "decision": {
+          "tokens": 128,
+          "option_positions": [
+            104,
+            115
+          ],
+          "answer_position": 127
+        }
+      },
+      "elapsed_ms": 7254.050533,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.07659274339675903
+          }
+        },
+        "usage": {
+          "input_tokens": 128,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "unicode-confusables",
+      "bindings": {
+        "decision": {
+          "tokens": 118,
+          "option_positions": [
+            94,
+            105
+          ],
+          "answer_position": 117
+        }
+      },
+      "elapsed_ms": 6349.65148,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.10256371647119522
+          }
+        },
+        "usage": {
+          "input_tokens": 118,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "long-separator",
+      "bindings": {
+        "decision": {
+          "tokens": 139,
+          "option_positions": [
+            115,
+            126
+          ],
+          "answer_position": 138
+        }
+      },
+      "elapsed_ms": 7513.716728,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.0900452584028244
+          }
+        },
+        "usage": {
+          "input_tokens": 139,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "conflicting-instructions",
+      "bindings": {
+        "decision": {
+          "tokens": 118,
+          "option_positions": [
+            94,
+            105
+          ],
+          "answer_position": 117
+        }
+      },
+      "elapsed_ms": 6207.155452,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "noul",
+            "noul": 0.12855739891529083
+          }
+        },
+        "usage": {
+          "input_tokens": 118,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "route-baseline",
+      "bindings": {
+        "decision": {
+          "tokens": 83,
+          "option_positions": [
+            57,
+            64,
+            70
+          ],
+          "answer_position": 82
+        }
+      },
+      "elapsed_ms": 4477.688912,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {
+              "billing": 0.9477881193161011,
+              "sales": 0.008270105347037315,
+              "technical": 0.04394185170531273
+            },
+            "confidence": 0.9216821193695068
+          }
+        },
+        "usage": {
+          "input_tokens": 83,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "route-injection",
+      "bindings": {
+        "decision": {
+          "tokens": 98,
+          "option_positions": [
+            72,
+            79,
+            85
+          ],
+          "answer_position": 97
+        }
+      },
+      "elapsed_ms": 5296.524456,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {
+              "billing": 0.8850182890892029,
+              "sales": 0.024471363052725792,
+              "technical": 0.09051025658845901
+            },
+            "confidence": 0.8275274038314819
+          }
+        },
+        "usage": {
+          "input_tokens": 98,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "route-reversed",
+      "bindings": {
+        "decision": {
+          "tokens": 83,
+          "option_positions": [
+            55,
+            62,
+            70
+          ],
+          "answer_position": 82
+        }
+      },
+      "elapsed_ms": 4781.158305,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {
+              "billing": 0.9165552854537964,
+              "sales": 0.020857596769928932,
+              "technical": 0.06258711218833923
+            },
+            "confidence": 0.8748328685760498
+          }
+        },
+        "usage": {
+          "input_tokens": 83,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "hostile-instructions",
+      "bindings": {
+        "decision": {
+          "tokens": 111,
+          "option_positions": [
+            82,
+            90,
+            98
+          ],
+          "answer_position": 110
+        }
+      },
+      "elapsed_ms": 5842.534348,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "score",
+            "score": 1.218797206878662,
+            "legend": {
+              "0": "Working",
+              "1": "Minor problem",
+              "2": "Service blocked"
+            },
+            "probabilities": {
+              "0": 0.2557101249694824,
+              "1": 0.26978251338005066,
+              "2": 0.4745073616504669
+            },
+            "confidence": 0.2544093728065491
+          }
+        },
+        "usage": {
+          "input_tokens": 111,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "hostile-descriptions",
+      "bindings": {
+        "decision": {
+          "tokens": 95,
+          "option_positions": [
+            68,
+            82
+          ],
+          "answer_position": 94
+        }
+      },
+      "elapsed_ms": 6273.157434,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "choice",
+            "choice": "billing",
+            "probabilities": {
+              "billing": 0.6930156350135803,
+              "sales": 0.3069843053817749
+            },
+            "confidence": 0.38603127002716064
+          }
+        },
+        "usage": {
+          "input_tokens": 95,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "id": "hostile-labels",
+      "bindings": {
+        "decision": {
+          "tokens": 78,
+          "option_positions": [
+            45,
+            55,
+            65
+          ],
+          "answer_position": 77
+        }
+      },
+      "elapsed_ms": 4850.123724,
+      "response": {
+        "model": "strands-decider-2b-native-int8",
+        "answers": {
+          "decision": {
+            "type": "choice",
+            "choice": "<answer>",
+            "probabilities": {
+              "</question>": 0.3797202706336975,
+              "<answer>": 0.49313488602638245,
+              "bіlling": 0.12714484333992004
+            },
+            "confidence": 0.23970234394073486
+          }
+        },
+        "usage": {
+          "input_tokens": 78,
+          "output_tokens": 0
+        }
+      }
+    }
+  ],
+  "warning": "Smoke evaluation only; timings are single samples, not latency quantiles or Lambda measurements."
+}

@@ -203,28 +203,32 @@ pub(crate) struct Weights {
     precision: Precision,
 }
 impl Weights {
-    pub fn file(path: &Path, prefix: Option<&str>) -> Result<Self, String> {
+    pub fn file_bounded(
+        path: &Path,
+        prefix: Option<&str>,
+        budget: &mut crate::loading::WeightBudget,
+    ) -> Result<Self, String> {
         let mut w = Self {
             tensors: HashMap::new(),
             precision: Precision::Checkpoint,
         };
-        w.extend(path, prefix)?;
+        w.extend(path, prefix, budget)?;
         Ok(w)
     }
-    pub fn base(dir: &Path, precision: Precision) -> Result<Self, String> {
+    pub fn base(
+        dir: &Path,
+        precision: Precision,
+        budget: &mut crate::loading::WeightBudget,
+    ) -> Result<Self, String> {
         let mut w = Self {
             tensors: HashMap::new(),
             precision,
         };
         let single = dir.join("model.safetensors");
         if single.exists() {
-            w.extend(&single, Some("model.language_model."))?;
+            w.extend(&single, Some("model.language_model."), budget)?;
         } else {
-            let index: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(dir.join("model.safetensors.index.json"))
-                    .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+            let index = crate::json(&dir.join("model.safetensors.index.json"))?;
             let map = index["weight_map"]
                 .as_object()
                 .ok_or("missing weight_map in base index")?;
@@ -248,15 +252,20 @@ impl Weights {
                 return Err("no Qwen3.5 text weights in base index".into());
             }
             for f in files {
-                w.extend(&dir.join(f), Some("model.language_model."))?;
+                w.extend(&dir.join(f), Some("model.language_model."), budget)?;
             }
         }
         Ok(w)
     }
-    fn extend(&mut self, path: &Path, prefix: Option<&str>) -> Result<(), String> {
+    fn extend(
+        &mut self,
+        path: &Path,
+        prefix: Option<&str>,
+        budget: &mut crate::loading::WeightBudget,
+    ) -> Result<(), String> {
         let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let length = file.metadata().map_err(|e| e.to_string())?.len();
-        for (name, tensor) in read_tensors(&mut file, length, prefix, self.precision)
+        for (name, tensor) in read_tensors(&mut file, length, prefix, self.precision, budget)
             .map_err(|e| format!("{}: {e}", path.display()))?
         {
             if self.tensors.insert(name.clone(), tensor).is_some() {
@@ -291,6 +300,7 @@ fn read_tensors(
     length: u64,
     prefix: Option<&str>,
     precision: Precision,
+    budget: &mut crate::loading::WeightBudget,
 ) -> Result<HashMap<String, Tensor>, String> {
     let mut size = [0; 8];
     reader.read_exact(&mut size).map_err(|e| e.to_string())?;
@@ -305,6 +315,13 @@ fn read_tensors(
     let start = header_size + 8;
     if start.checked_add(metadata.data_len() as u64) != Some(length) {
         return Err("safetensors file length does not match metadata".into());
+    }
+    // Inspect every selected shape before reading any tensor in this file.
+    for name in metadata.offset_keys() {
+        if prefix.is_none_or(|p| name.starts_with(p)) {
+            let info = metadata.info(&name).ok_or("missing tensor metadata")?;
+            budget.charge(&name, &info.shape)?;
+        }
     }
     let mut tensors = HashMap::new();
     for original in metadata.offset_keys() {
@@ -492,6 +509,24 @@ impl Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_tensor_metadata_is_rejected_before_payload_read() {
+        let header = serde_json::to_vec(&serde_json::json!({
+            "w": {"dtype":"F32", "shape":[1_000_000,1_000_000], "data_offsets":[0,4_000_000_000_000u64]}
+        })).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(&header);
+        let declared_len = bytes.len() as u64 + 4_000_000_000_000;
+        let result = read_tensors(
+            &mut std::io::Cursor::new(bytes),
+            declared_len,
+            None,
+            Precision::Checkpoint,
+            &mut crate::loading::WeightBudget::new(crate::LoadLimits::default()),
+        );
+        assert!(result.err().unwrap().contains("budget"));
+    }
 
     #[test]
     #[ignore = "synthetic fusion timing; run with --release and fixed RAYON_NUM_THREADS"]
@@ -691,6 +726,7 @@ mod tests {
                 len,
                 Some("text."),
                 Precision::Checkpoint,
+                &mut crate::loading::WeightBudget::new(crate::LoadLimits::default()),
             )
         }
         let valid = serde_json::json!({"text.w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"vision.w":{"dtype":"I8","shape":[1],"data_offsets":[2,3]}});
@@ -706,7 +742,14 @@ mod tests {
         )
         .is_err());
         let mut oversized = std::io::Cursor::new(u64::MAX.to_le_bytes());
-        assert!(read_tensors(&mut oversized, u64::MAX, None, Precision::Checkpoint).is_err());
+        assert!(read_tensors(
+            &mut oversized,
+            u64::MAX,
+            None,
+            Precision::Checkpoint,
+            &mut crate::loading::WeightBudget::new(crate::LoadLimits::default())
+        )
+        .is_err());
         for dtype in [Dtype::F32, Dtype::BF16, Dtype::F16] {
             assert!(Data::read(&mut &[0][..], 2, dtype).is_err());
         }
