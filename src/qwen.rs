@@ -259,6 +259,7 @@ struct Delta {
     a: Linear,
     b: Linear,
     out: Linear,
+    /// Depthwise convolution weights, tap-major: `conv[tap * width + channel]`.
     conv: Vec<f32>,
     dt: Vec<f32>,
     decay_rate: Vec<f32>,
@@ -327,10 +328,13 @@ impl Model {
                     a: linear("linear_attn.in_proj_a", h, c.linear_num_value_heads)?,
                     b: linear("linear_attn.in_proj_b", h, c.linear_num_value_heads)?,
                     out: linear("linear_attn.out_proj", vd, h)?,
-                    conv: w.take(
-                        &format!("{p}.linear_attn.conv1d.weight"),
-                        &[2 * kd + vd, 1, c.linear_conv_kernel_dim],
-                    )?,
+                    conv: tap_major(
+                        &w.take(
+                            &format!("{p}.linear_attn.conv1d.weight"),
+                            &[2 * kd + vd, 1, c.linear_conv_kernel_dim],
+                        )?,
+                        c.linear_conv_kernel_dim,
+                    ),
                     dt: w.take(
                         &format!("{p}.linear_attn.dt_bias"),
                         &[c.linear_num_value_heads],
@@ -684,38 +688,63 @@ impl Delta {
     }
 }
 
+/// Checkpoint `[channel][1][tap]` convolution weights as `[tap][channel]`.
+fn tap_major(weights: &[f32], kernel: usize) -> Vec<f32> {
+    let width = weights.len() / kernel;
+    (0..kernel * width)
+        .map(|i| weights[(i % width) * kernel + i / width])
+        .collect()
+}
+
 /// Causal depthwise convolution with SiLU over `raw` (`n` rows of `width`
 /// channels) for tokens at positions `start..start + n`; inputs before `start`
-/// come from `tail`, the preceding tokens' last rows.
+/// come from `tail`, the preceding tokens' last rows. `taps` is tap-major.
+///
+/// Each channel's sum starts at zero and adds `input * weight` tap by tap in
+/// order, skipping taps before the sequence start, as a scalar loop would. Rows
+/// are independent, so they run in parallel, and channels vectorize.
 fn convolve(
     raw: &[f32],
     tail: &[f32],
     start: usize,
     width: usize,
     kernel: usize,
-    weights: &[f32],
+    taps: &[f32],
 ) -> Vec<f32> {
     let n = raw.len() / width;
     let tail_rows = tail.len() / width;
-    let mut conv = vec![0.0; raw.len()];
-    for t in 0..n {
+    assert_eq!(taps.len(), kernel * width);
+    let row = |t: usize, out: &mut [f32]| {
         let position = start + t;
-        for channel in 0..width {
-            let mut sum = 0.0;
-            for j in 0..kernel {
-                if position + j + 1 >= kernel {
-                    // Inputs before `start` come from the preceding tokens' tail.
-                    let source = position + j + 1 - kernel;
-                    let value = if source >= start {
-                        raw[(source - start) * width + channel]
-                    } else {
-                        tail[(source + tail_rows - start) * width + channel]
-                    };
-                    sum += value * weights[channel * kernel + j];
-                }
+        for (j, weights) in taps.chunks_exact(width).enumerate() {
+            if position + j + 1 < kernel {
+                continue;
             }
-            conv[t * width + channel] = silu(sum);
+            // Inputs before `start` come from the preceding tokens' tail.
+            let source = position + j + 1 - kernel;
+            let input = if source >= start {
+                &raw[(source - start) * width..(source - start + 1) * width]
+            } else {
+                let row = source + tail_rows - start;
+                &tail[row * width..(row + 1) * width]
+            };
+            for ((sum, x), w) in out.iter_mut().zip(input).zip(weights) {
+                *sum += x * w;
+            }
         }
+        for sum in out.iter_mut() {
+            *sum = silu(*sum);
+        }
+    };
+    let mut conv = vec![0.0; raw.len()];
+    if n * width >= 1 << 16 && rayon::current_num_threads() > 1 {
+        conv.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(t, out)| row(t, out));
+    } else {
+        conv.chunks_mut(width)
+            .enumerate()
+            .for_each(|(t, out)| row(t, out));
     }
     conv
 }
@@ -1043,6 +1072,89 @@ mod tests {
                     rms(&mut t, &vec![0.1; h], 1e-6, true);
                     black_box(t);
                 });
+            }
+        }
+    }
+
+    /// The original channel-by-channel convolution over checkpoint-layout weights.
+    fn reference_convolve(
+        raw: &[f32],
+        tail: &[f32],
+        start: usize,
+        width: usize,
+        kernel: usize,
+        weights: &[f32],
+    ) -> Vec<f32> {
+        let n = raw.len() / width;
+        let tail_rows = tail.len() / width;
+        let mut conv = vec![0.0; raw.len()];
+        for t in 0..n {
+            let position = start + t;
+            for channel in 0..width {
+                let mut sum = 0.0;
+                for j in 0..kernel {
+                    if position + j + 1 >= kernel {
+                        let source = position + j + 1 - kernel;
+                        let value = if source >= start {
+                            raw[(source - start) * width + channel]
+                        } else {
+                            tail[(source + tail_rows - start) * width + channel]
+                        };
+                        sum += value * weights[channel * kernel + j];
+                    }
+                }
+                conv[t * width + channel] = silu(sum);
+            }
+        }
+        conv
+    }
+
+    #[test]
+    fn vectorized_convolution_matches_channel_loop_exactly() {
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|t| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(t)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let value = |i: usize, m: usize| match i % 13 {
+            0 => -0.0,
+            1 => 1e-30,
+            k => ((i * m % 997) as f32 - 498.0) / (k as f32 * 9.0),
+        };
+        // Widths on both sides of the parallel threshold; sequences shorter than
+        // the kernel; continuations after 0, 1, 2 and 3 tail rows.
+        for (width, kernel) in [(5, 4), (64, 4), (6144, 4), (7, 1), (9, 3)] {
+            let weights: Vec<f32> = (0..width * kernel).map(|i| value(i, 31)).collect();
+            let taps = tap_major(&weights, kernel);
+            for (start, n) in [
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 17),
+                (1, 4),
+                (2, 1),
+                (3, 5),
+                (9, 12),
+            ] {
+                let tail_rows = start.min(kernel - 1);
+                let tail: Vec<f32> = (0..tail_rows * width).map(|i| value(i, 17)).collect();
+                let raw: Vec<f32> = (0..n * width).map(|i| value(i, 43)).collect();
+                let expected = reference_convolve(&raw, &tail, start, width, kernel, &weights);
+                for pool in &pools {
+                    let actual =
+                        pool.install(|| convolve(&raw, &tail, start, width, kernel, &taps));
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "width {width}, kernel {kernel}, start {start}, n {n}"
+                    );
+                }
             }
         }
     }
