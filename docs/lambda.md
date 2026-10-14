@@ -84,8 +84,9 @@ Bound request bytes, question count, and total tokens in the host. A useful
 initial experiment is 1–3 questions with at most 512 tokens per bound prompt;
 use `engine.encode` to check the token count before forwarding. This is a
 starting point, not the model's context limit. Increase it after measuring.
-Activation memory and duration grow with the prompt length. Questions currently
-repeat the state forward; no shared-prefix cache is implemented.
+Activation memory and duration grow with the prompt length. Requests with two
+or more questions run the state once and continue each question from cached
+layer state, so extra questions cost roughly their own tokens.
 
 Checkpoint mode preserves the published weights and provides the parity
 baseline. INT8 is a conservative first compression experiment; INT4 saves more
@@ -247,7 +248,7 @@ Apply `InferenceLimits::lambda()` through `engine.decide_with_limits(&request,
 question, 64 KiB of canonical JSON state, 256 KiB of canonical JSON request,
 2048 bound tokens per question and 4096 tokens in total. These are initial
 admission limits to validate with your workload, not measured Lambda time bounds.
-Each question repeats the state and incurs a separate forward pass. All limits
+Token limits count the state once per question; the state itself runs once. All limits
 are checked before any forward pass, so an invalid final question cannot cause
 earlier questions to execute. Limit raw HTTP/event body size before JSON parsing,
 reuse one loaded engine, serialize inference per execution environment, and set
