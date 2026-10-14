@@ -23,11 +23,11 @@ jobs:
       RAYON_NUM_THREADS: '4'
       DECIDER_TEST_MODEL_DIR: models/v21
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: '1.98.0'
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Acquire pinned, hash-verified weights and licenses
         run: python3 scripts/download-model.py models/v21
       - name: Record machine, toolchain, source, and checkpoint revisions
@@ -50,7 +50,7 @@ jobs:
           cargo test --release --locked --test model -- --ignored --nocapture 2>&1 | tee validation/parity.log
       - name: Preserve validation evidence (no weights)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: v21-parity-${{ matrix.os }}
           path: validation/
@@ -64,8 +64,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: '1.98.0'
       - name: Check package version matches tag
@@ -78,7 +78,7 @@ jobs:
           PY
       - name: Verify and package source
         run: cargo package --locked
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: v21-parity-*
           path: validation

@@ -4,3 +4,4 @@
 **/*.part
 models/v21/.pull.lock
 lambda/results
+**/*.corrupt-*
