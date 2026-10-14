@@ -507,6 +507,40 @@ impl Linear {
 }
 
 #[cfg(test)]
+impl Linear {
+    /// Deterministic BF16 base weights with an F32 rank-`rank` adapter, as in the
+    /// v21 checkpoint, for benchmarks at real dimensions.
+    pub(crate) fn synthetic(
+        input: usize,
+        output: usize,
+        rank: usize,
+        seed: usize,
+        precision: Precision,
+    ) -> Self {
+        let value = |i: usize, scale: f32| {
+            ((i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 2001) as f32 - 1000.0) * scale
+        };
+        let bf16 = Data::Bf16(
+            (0..input * output)
+                .map(|i| (value(i, 2e-5).to_bits() >> 16) as u16)
+                .collect(),
+        );
+        Self {
+            w: bf16.quantize(input, precision),
+            bias: None,
+            input,
+            output,
+            lora: Some((
+                Data::F32((0..rank * input).map(|i| value(i + 7, 1e-5)).collect()),
+                Data::F32((0..output * rank).map(|i| value(i + 13, 1e-5)).collect()),
+                rank,
+                2.0,
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
