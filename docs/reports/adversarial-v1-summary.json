@@ -1,0 +1,118 @@
+{
+  "validation_status": "UNVALIDATED: smoke data cannot establish deployment quality or calibration",
+  "modes": {
+    "checkpoint": {
+      "cases": 12,
+      "labeled_decisions": 9,
+      "semantic_failures": [],
+      "answer_flips_vs_checkpoint": [],
+      "mean_absolute_probability_drift": 0.0,
+      "max_absolute_probability_drift": 0.0,
+      "max_relative_probability_drift_floor_1e_6": 0.0,
+      "max_expected_score_drift": 0.0,
+      "confidence_threshold_crossings_vs_checkpoint": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "labeled_brier_sum_over_classes": 0.01710708399036108,
+      "labeled_nll": 0.09720798274979611,
+      "labeled_ece_10_bins": 0.09238521920310126,
+      "confident_wrong_decisions": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "correct_but_below_threshold": {
+        "0.8": 0,
+        "0.9": 4,
+        "0.95": 9
+      }
+    },
+    "int8": {
+      "cases": 12,
+      "labeled_decisions": 9,
+      "semantic_failures": [],
+      "answer_flips_vs_checkpoint": [],
+      "mean_absolute_probability_drift": 0.0009565618017624164,
+      "max_absolute_probability_drift": 0.00209614634513855,
+      "max_relative_probability_drift_floor_1e_6": 0.020420928752394343,
+      "max_expected_score_drift": 0.0012423992156982422,
+      "confidence_threshold_crossings_vs_checkpoint": {
+        "0.8": 0,
+        "0.9": 1,
+        "0.95": 0
+      },
+      "labeled_brier_sum_over_classes": 0.016850654199653512,
+      "labeled_nll": 0.09636837841541973,
+      "labeled_ece_10_bins": 0.09161550634437138,
+      "confident_wrong_decisions": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "correct_but_below_threshold": {
+        "0.8": 0,
+        "0.9": 3,
+        "0.95": 9
+      }
+    },
+    "int8-compute": {
+      "cases": 12,
+      "labeled_decisions": 9,
+      "semantic_failures": [],
+      "answer_flips_vs_checkpoint": [],
+      "mean_absolute_probability_drift": 0.0013234272984595135,
+      "max_absolute_probability_drift": 0.00593942403793335,
+      "max_relative_probability_drift_floor_1e_6": 0.03636968092806368,
+      "max_expected_score_drift": 0.005244731903076172,
+      "confidence_threshold_crossings_vs_checkpoint": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "labeled_brier_sum_over_classes": 0.0170364944875112,
+      "labeled_nll": 0.09700085203818823,
+      "labeled_ece_10_bins": 0.09220343248711692,
+      "confident_wrong_decisions": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "correct_but_below_threshold": {
+        "0.8": 0,
+        "0.9": 4,
+        "0.95": 9
+      }
+    },
+    "int4": {
+      "cases": 12,
+      "labeled_decisions": 9,
+      "semantic_failures": [],
+      "answer_flips_vs_checkpoint": [],
+      "mean_absolute_probability_drift": 0.026519593718493807,
+      "max_absolute_probability_drift": 0.09396803379058838,
+      "max_relative_probability_drift_floor_1e_6": 1.566087096248843,
+      "max_expected_score_drift": 0.04522871971130371,
+      "confidence_threshold_crossings_vs_checkpoint": {
+        "0.8": 0,
+        "0.9": 4,
+        "0.95": 0
+      },
+      "labeled_brier_sum_over_classes": 0.025022080291408972,
+      "labeled_nll": 0.1179707493466357,
+      "labeled_ece_10_bins": 0.11052866197294658,
+      "confident_wrong_decisions": {
+        "0.8": 0,
+        "0.9": 0,
+        "0.95": 0
+      },
+      "correct_but_below_threshold": {
+        "0.8": 0,
+        "0.9": 4,
+        "0.95": 9
+      }
+    }
+  },
+  "suite_sha256": "64e9c76101672c769ac177ae6da37ee89dfec364a1d95912b4849cbcf16449ae"
+}

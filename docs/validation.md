@@ -39,6 +39,9 @@ and hostile instructions, descriptions and labels. It is **not** a representativ
 held-out deployment corpus. Nine cases carry deliberately simple semantic labels;
 the other three exercise structural handling without claiming an intended answer.
 
+See the [2026-10-14 v21 report](reports/adversarial-v1.md) for measured outputs,
+probability drift and the remaining acceptance criteria for each issue.
+
 Default tests exercise all four precision modes with synthetic weights. They
 check deterministic binding, byte-span/option ordering, legal answer domains,
 finite probabilities and token-window admission. These are software properties,

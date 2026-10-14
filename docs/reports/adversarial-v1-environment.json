@@ -1,0 +1,19 @@
+{
+  "engine_source_commit": "748a17368a386b4f4b9dd4f4772d536051447ac3",
+  "checkpoint_revisions": {
+    "decider": "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5",
+    "base": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c"
+  },
+  "suite_sha256": "64e9c76101672c769ac177ae6da37ee89dfec364a1d95912b4849cbcf16449ae",
+  "architecture": "x86_64",
+  "cpu": "AMD EPYC 9V74 80-Core Processor (virtualized)",
+  "container_memory_limit_bytes": 8589934592,
+  "container_cpu_quota_cores": 8,
+  "rayon_workers": 4,
+  "toolchain": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8",
+  "evaluation_date_utc": "2026-10-14",
+  "int8_compute_backend": "portable scalar; not ARM SDOT",
+  "command": "RAYON_NUM_THREADS=4 target/release/examples/evaluate models/v21 tests/fixtures/adversarial.json PRECISION",
+  "sampling": "One evaluation per case and precision; timing values are not benchmarks or quantiles.",
+  "engine_source_tree": "202fb1053a6beec2978c71cffccf89a6f54c4131"
+}
