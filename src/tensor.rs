@@ -52,28 +52,43 @@ pub(crate) fn dot_tile(xs: [&[f32]; 3], ws: [&[f32]; 3]) -> [[f32; 3]; 3] {
     let len = xs[0].len();
     assert!(xs.iter().chain(&ws).all(|v| v.len() == len));
     let chunks = len / 8;
-    let xr: [&[[f32; 8]]; 3] = std::array::from_fn(|i| xs[i].as_chunks::<8>().0);
-    let wr: [&[[f32; 8]]; 3] = std::array::from_fn(|j| ws[j].as_chunks::<8>().0);
-    let mut lanes = [[0.0f32; 8]; 9];
-    for k in 0..chunks {
-        let a: [[f32; 8]; 3] = std::array::from_fn(|i| xr[i][k]);
-        let b: [[f32; 8]; 3] = std::array::from_fn(|j| wr[j][k]);
-        for i in 0..3 {
-            for j in 0..3 {
-                let acc = &mut lanes[i * 3 + j];
-                for q in 0..8 {
-                    if cfg!(target_arch = "aarch64") {
-                        acc[q] = a[i][q].mul_add(b[j][q], acc[q]);
-                    } else {
-                        acc[q] += a[i][q] * b[j][q];
-                    }
-                }
+    let [x0, x1, x2] = xs.map(|x| x.as_chunks::<8>().0);
+    let [w0, w1, w2] = ws.map(|w| w.as_chunks::<8>().0);
+    /// One `dot_scores` lane step for eight lanes.
+    #[inline(always)]
+    fn step(acc: [f32; 8], a: &[f32; 8], b: &[f32; 8]) -> [f32; 8] {
+        std::array::from_fn(|q| {
+            if cfg!(target_arch = "aarch64") {
+                a[q].mul_add(b[q], acc[q])
+            } else {
+                acc[q] + a[q] * b[q]
             }
-        }
+        })
     }
+    // Nine separately named accumulators, updated as whole values, stay in
+    // registers; an indexed accumulator array was written to the stack on
+    // every iteration. Zipped iterators avoid bounds checks in the loop.
+    let zero = [0.0f32; 8];
+    let (mut l00, mut l01, mut l02) = (zero, zero, zero);
+    let (mut l10, mut l11, mut l12) = (zero, zero, zero);
+    let (mut l20, mut l21, mut l22) = (zero, zero, zero);
+    let x_chunks = x0.iter().zip(x1).zip(x2);
+    let w_chunks = w0.iter().zip(w1).zip(w2);
+    for (((a0, a1), a2), ((b0, b1), b2)) in x_chunks.zip(w_chunks) {
+        l00 = step(l00, a0, b0);
+        l01 = step(l01, a0, b1);
+        l02 = step(l02, a0, b2);
+        l10 = step(l10, a1, b0);
+        l11 = step(l11, a1, b1);
+        l12 = step(l12, a1, b2);
+        l20 = step(l20, a2, b0);
+        l21 = step(l21, a2, b1);
+        l22 = step(l22, a2, b2);
+    }
+    let lanes = [[l00, l01, l02], [l10, l11, l12], [l20, l21, l22]];
     std::array::from_fn(|i| {
         std::array::from_fn(|j| {
-            let mut sum = lanes[i * 3 + j].iter().sum::<f32>();
+            let mut sum = lanes[i][j].iter().sum::<f32>();
             for t in chunks * 8..len {
                 sum += xs[i][t] * ws[j][t];
             }
