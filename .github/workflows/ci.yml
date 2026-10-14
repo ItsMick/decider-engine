@@ -53,6 +53,9 @@ jobs:
                   raise SystemExit(f"{name}: unexpected SHA256")
           EOF
           DECIDER_TEST_ENCODER_DIR=encoder cargo test --locked --test encoding -- --ignored
+      - name: Measure bit-exact tiled projections (issue 6 prototype)
+        if: matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest' || matrix.rust == 'stable'
+        run: cargo run --release --example tile_bench
       - name: Measure synthetic ARM projections
         if: matrix.os == 'ubuntu-24.04-arm'
         env:
