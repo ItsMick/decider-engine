@@ -44,6 +44,12 @@ impl InferenceLimits {
 
     /// Validate byte/collection budgets before rendering or tokenization.
     pub fn validate(&self, request: &Request) -> Result<(), String> {
+        self.check_budgets(request)?;
+        request.validate()
+    }
+
+    /// The budget checks alone, without schema validation.
+    pub(crate) fn check_budgets(&self, request: &Request) -> Result<(), String> {
         check(
             "question count",
             request.questions.len(),
@@ -86,8 +92,7 @@ impl InferenceLimits {
             }
         }
         json_budget(&request.state, self.max_state_bytes, "state bytes")?;
-        json_budget(request, self.max_request_bytes, "request bytes")?;
-        request.validate()
+        json_budget(request, self.max_request_bytes, "request bytes")
     }
 
     pub(crate) fn add_tokens(&self, total: usize, tokens: usize) -> Result<usize, String> {

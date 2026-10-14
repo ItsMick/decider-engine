@@ -5,6 +5,7 @@
 //! are rejected in full rather than silently losing state or options.
 #![deny(unsafe_code)]
 
+mod error;
 mod int8;
 mod limits;
 mod loading;
@@ -15,6 +16,7 @@ mod tensor;
 mod weights;
 
 use crate::tensor::{dot_scores, softmax};
+pub use error::{DecideError, ErrorKind};
 pub use limits::InferenceLimits;
 pub use loading::LoadLimits;
 pub use schema::{Answer, Question, Request, Response};
@@ -24,6 +26,24 @@ use std::{collections::BTreeMap, path::Path};
 use weights::{Linear, Weights};
 
 pub const ENGINE_ID: &str = "strands-decider-2b-native";
+/// Model ID that names the pinned v21 export rather than whichever checkpoint is loaded.
+pub const V21_MODEL_ID: &str = "strands-decider-2B-hobson-v21";
+/// Strands and Qwen revisions pinned by `scripts/download-model.py`.
+pub const V21_REVISION: &str = "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5";
+pub const V21_BASE_REVISION: &str = "b1485b2fa6dfa1287294f269f5fb618e03d52d7c";
+/// Accepted by any engine, whatever checkpoint and precision it loaded.
+pub const LATEST_MODEL_ID: &str = "strands-decider-latest";
+
+/// Whether `Precision::Int8Compute` uses native integer dot products on this CPU.
+/// Without them it runs a portable fallback that is usually slower than FP32.
+pub fn int8_compute_accelerated() -> bool {
+    int8::Kernel::detect().accelerated()
+}
+
+/// Compiles the README's Rust examples as doc tests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 /// Lower precision modes quantize base linear weights only and need quality evaluation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Precision {
@@ -117,6 +137,19 @@ pub struct NativeEngine {
     head: Head,
     config: DeciderConfig,
     precision: Precision,
+    revisions: Option<Revisions>,
+}
+
+/// Recorded by `scripts/download-model.py` as `revisions.json`.
+#[derive(Deserialize)]
+struct Revisions {
+    decider: String,
+    base: String,
+}
+impl Revisions {
+    fn is_pinned_v21(&self) -> bool {
+        self.decider == V21_REVISION && self.base == V21_BASE_REVISION
+    }
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Encoding {
@@ -153,7 +186,7 @@ impl NativeEngine {
         request: &Request,
         limits: &InferenceLimits,
     ) -> Result<Response, String> {
-        self.decide_bounded(request, limits)
+        Ok(self.evaluate(request, limits)?)
     }
     /// `dir` holds a Strands export and a `base/` directory with Qwen weights.
     pub fn load(dir: &Path) -> Result<Self, String> {
@@ -255,6 +288,15 @@ impl NativeEngine {
             cfg.hidden_size,
             config.pointer_dim,
         )?;
+        let revisions_path = dir.join("revisions.json");
+        let revisions = if revisions_path.exists() {
+            Some(
+                serde_json::from_value::<Revisions>(json(&revisions_path)?)
+                    .map_err(|e| format!("{}: {e}", revisions_path.display()))?,
+            )
+        } else {
+            None
+        };
         let model = qwen::Model::load(
             Weights::base(&dir.join("base"), precision, &mut budget)?,
             &mut adapter,
@@ -268,17 +310,27 @@ impl NativeEngine {
             head,
             config,
             precision,
+            revisions,
         })
     }
     pub fn max_length(&self) -> usize {
         self.config.max_length
+    }
+    /// The Strands export revision recorded in `revisions.json`, if present.
+    pub fn checkpoint_revision(&self) -> Option<&str> {
+        self.revisions.as_ref().map(|r| r.decider.as_str())
     }
     /// Useful for reference parity checks; offsets are computed from the exact BPE encoding.
     pub fn encode(&self, state: &Value, question: &Question) -> Result<Encoding, String> {
         schema::content(state, false)?;
         question.validate()?;
         let rendered = prompt::render(question);
-        encode(&self.tokenizer, state, &rendered, self.config.max_length)
+        Ok(encode(
+            &self.tokenizer,
+            state,
+            &rendered,
+            self.config.max_length,
+        )?)
     }
     /// Run an already bound prompt through the native torso and pointer head.
     pub fn raw_logits(&self, encoded: &Encoding) -> Result<Vec<f32>, String> {
@@ -303,17 +355,21 @@ fn encode(
     state: &Value,
     rendered: &prompt::Rendered,
     max_length: usize,
-) -> Result<Encoding, String> {
+) -> Result<Encoding, DecideError> {
+    let engine = |e: tokenizers::Error| DecideError::new(ErrorKind::Engine, e.to_string());
     // Strands tokenizes the prefix and question independently, then concatenates.
     let s = tokenizer
         .encode(prompt::render_state(state), true)
-        .map_err(|e| e.to_string())?;
+        .map_err(engine)?;
     let q = tokenizer
         .encode(rendered.text.as_str(), false)
-        .map_err(|e| e.to_string())?;
+        .map_err(engine)?;
     let total = s.len() + q.len();
     if total > max_length {
-        return Err(format!("prompt of {total} tokens exceeds context window of {max_length}; shorten the state or question"));
+        return Err(DecideError::new(
+            ErrorKind::ContextWindow,
+            format!("prompt of {total} tokens exceeds context window of {max_length}; shorten the state or question"),
+        ));
     }
     let mut positions = Vec::new();
     for (start, end) in &rendered.spans {
@@ -324,7 +380,9 @@ fn encode(
             .filter(|(_, (lo, hi))| hi > lo && lo >= start && hi <= end)
             .map(|(i, _)| i)
             .next_back()
-            .ok_or("option has no tokens in its span")?;
+            .ok_or_else(|| {
+                DecideError::new(ErrorKind::Engine, "option has no tokens in its span")
+            })?;
         positions.push(s.len() + index);
     }
     let ids = s.get_ids().iter().chain(q.get_ids()).copied().collect();
@@ -339,24 +397,28 @@ impl DecisionEngine for NativeEngine {
         self.precision.engine_id()
     }
     fn decide(&self, request: &Request) -> Result<Response, String> {
-        self.decide_bounded(request, &InferenceLimits::default())
+        Ok(self.evaluate(request, &InferenceLimits::default())?)
     }
 }
 
 impl NativeEngine {
-    fn decide_bounded(
+    /// `decide_with_limits` with a typed error. Every question is validated and
+    /// bound before any forward pass; errors never return partial answers.
+    pub fn evaluate(
         &self,
         request: &Request,
         limits: &InferenceLimits,
-    ) -> Result<Response, String> {
-        limits.validate(request)?;
-        if request.model.as_deref().is_some_and(|m| {
-            m != self.model()
-                && m != ENGINE_ID
-                && m != "strands-decider-latest"
-                && m != "strands-decider-2B-hobson-v21"
-        }) {
-            return Err("requested model is not this native engine".into());
+    ) -> Result<Response, DecideError> {
+        let fail = |kind| move |message: String| DecideError::new(kind, message);
+        limits
+            .check_budgets(request)
+            .map_err(fail(ErrorKind::ResourceLimit))?;
+        request
+            .validate()
+            .map_err(fail(ErrorKind::InvalidRequest))?;
+        if let Some(requested) = request.model.as_deref() {
+            self.check_model(requested)
+                .map_err(fail(ErrorKind::ModelMismatch))?;
         }
         // Validate and bind every question before spending CPU on any of them.
         let mut total_tokens = 0;
@@ -369,16 +431,18 @@ impl NativeEngine {
                     &self.tokenizer,
                     &request.state,
                     &rendered,
-                    self.max_length().min(limits.max_question_tokens),
+                    self.max_length(),
                 )?;
-                total_tokens = limits.add_tokens(total_tokens, enc.input_ids.len())?;
+                total_tokens = limits
+                    .add_tokens(total_tokens, enc.input_ids.len())
+                    .map_err(fail(ErrorKind::ResourceLimit))?;
                 Ok((name, q, rendered, enc))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, DecideError>>()?;
         let mut input_tokens = 0;
         let mut answers = BTreeMap::new();
         for (name, q, rendered, enc) in encoded {
-            let mut logits = self.raw_logits(&enc)?;
+            let mut logits = self.raw_logits(&enc).map_err(fail(ErrorKind::Engine))?;
             let temperature = self
                 .config
                 .temperature_by_kind
@@ -390,7 +454,10 @@ impl NativeEngine {
             }
             softmax(&mut logits);
             if logits.iter().any(|p| !p.is_finite()) {
-                return Err("non-finite decision probabilities".into());
+                return Err(DecideError::new(
+                    ErrorKind::Engine,
+                    "non-finite decision probabilities",
+                ));
             }
             answers.insert(
                 name.clone(),
@@ -406,6 +473,31 @@ impl NativeEngine {
                 output_tokens: 0,
             },
         })
+    }
+
+    /// A request may pin this engine's exact ID (which includes the precision),
+    /// the `strands-decider-latest` alias, or the v21 export when `revisions.json`
+    /// records the pinned revisions.
+    fn check_model(&self, requested: &str) -> Result<(), String> {
+        if requested == self.model() || requested == LATEST_MODEL_ID {
+            return Ok(());
+        }
+        if requested == V21_MODEL_ID {
+            return match &self.revisions {
+                Some(r) if r.is_pinned_v21() => Ok(()),
+                Some(r) => Err(format!(
+                    "{V21_MODEL_ID} requires Strands revision {V21_REVISION} and Qwen revision {V21_BASE_REVISION}; revisions.json records {} and {}",
+                    r.decider, r.base
+                )),
+                None => Err(format!(
+                    "{V21_MODEL_ID} requires revisions.json recording the pinned revisions; this checkpoint has none"
+                )),
+            };
+        }
+        Err(format!(
+            "requested model {requested:?} is not served by this engine ({}); use {LATEST_MODEL_ID:?} or the exact engine ID",
+            self.model()
+        ))
     }
 }
 
@@ -447,6 +539,63 @@ mod tests {
     }
     fn fixture() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
+    }
+    fn copied_fixture(name: &str, revisions: Option<(&str, &str)>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("decider-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for file in [
+            "strands_decider_config.json",
+            "tokenizer.json",
+            "head.safetensors",
+            "lora/adapter_config.json",
+            "lora/adapter_model.safetensors",
+            "base/config.json",
+            "base/model.safetensors",
+        ] {
+            std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+            std::fs::copy(fixture().join(file), dir.join(file)).unwrap();
+        }
+        if let Some((decider, base)) = revisions {
+            let record = serde_json::json!({"decider": decider, "base": base});
+            std::fs::write(dir.join("revisions.json"), record.to_string()).unwrap();
+        }
+        dir
+    }
+    #[test]
+    fn model_ids_must_name_this_precision_or_a_verified_checkpoint() {
+        let request = |model: &str| -> Request {
+            let mut request: Request =
+                serde_json::from_str(include_str!("../tests/request.json")).unwrap();
+            request.model = Some(model.into());
+            request
+        };
+        let limits = InferenceLimits::default();
+        let int4 = NativeEngine::load_with_precision(&fixture(), Precision::Int4).unwrap();
+        assert!(int4.evaluate(&request(LATEST_MODEL_ID), &limits).is_ok());
+        assert!(int4.evaluate(&request(int4.model()), &limits).is_ok());
+        let error = int4.evaluate(&request(ENGINE_ID), &limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ModelMismatch);
+        // No revisions.json: the v21 alias cannot be verified.
+        assert_eq!(int4.checkpoint_revision(), None);
+        let error = int4.evaluate(&request(V21_MODEL_ID), &limits).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ModelMismatch);
+        assert!(error.message().contains("revisions.json"));
+
+        let pinned = copied_fixture("pinned", Some((V21_REVISION, V21_BASE_REVISION)));
+        let engine = NativeEngine::load(&pinned).unwrap();
+        assert_eq!(engine.checkpoint_revision(), Some(V21_REVISION));
+        assert!(engine.evaluate(&request(V21_MODEL_ID), &limits).is_ok());
+        let other = copied_fixture("other", Some(("0123456789", V21_BASE_REVISION)));
+        let engine = NativeEngine::load(&other).unwrap();
+        let error = engine
+            .evaluate(&request(V21_MODEL_ID), &limits)
+            .unwrap_err();
+        assert!(error.message().contains("0123456789"));
+        std::fs::write(other.join("revisions.json"), "{}").unwrap();
+        assert!(NativeEngine::load(&other).is_err());
+        for dir in [pinned, other] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
     fn close(a: &Value, b: &Value, tolerance: f64) {
         match (a, b) {

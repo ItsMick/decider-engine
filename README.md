@@ -34,9 +34,24 @@ The v21 model occupies roughly 4 GB resident memory. Loading streams tensors
 through a bounded buffer instead of holding a second copy of the checkpoint.
 
 With no request file, stdin accepts one JSON request per line and stdout returns
-one response per line. The model stays loaded until EOF. Blank lines are skipped;
-invalid requests stop the process with an error on stderr and a nonzero exit status.
-The CLI limits each request to 2 MiB.
+one line per non-blank input line, in order. The model stays loaded until EOF.
+A request that cannot be answered produces an error line instead of a response,
+and the process keeps reading:
+
+```json
+{"error":{"kind":"context_window","message":"prompt of 4210 tokens exceeds context window of 4096; shorten the state or question"}}
+```
+
+`kind` is `invalid_request`, `context_window`, `resource_limit`, `model_mismatch`
+or `engine`. Only I/O failures stop the loop. The CLI limits each request line
+to 2 MiB, excluding its newline; the rest of a longer line is skipped and reported
+as `resource_limit`. With a request file, an error goes to stderr with a nonzero
+exit status. `--precision` may appear anywhere on the command line.
+
+A request's optional `model` must be the engine's exact ID (which includes the
+precision suffix), `strands-decider-latest`, or `strands-decider-2B-hobson-v21`.
+The last is accepted only when the model directory's `revisions.json`, written
+by the download script, records the pinned Strands and Qwen revisions.
 
 ```json
 {"state":"A payment failed three times.","questions":{"urgent":{"type":"noul","instructions":"Does this need attention?"}}}
@@ -63,6 +78,22 @@ let request: Request = serde_json::from_str(r#"{
 let response = engine.decide(&request)?;
 println!("{}", serde_json::to_string(&response).map_err(|e| e.to_string())?);
 # Ok(())
+# }
+```
+
+`decide` and `decide_with_limits` return the error message as a `String`.
+`evaluate(&request, &limits)` returns a `DecideError` instead, whose `kind()`
+separates request problems from engine faults (`is_client_error()`):
+
+```rust,no_run
+use decider_engine::{ErrorKind, InferenceLimits, NativeEngine, Request};
+# fn handle(engine: &NativeEngine, request: &Request) {
+match engine.evaluate(request, &InferenceLimits::lambda()) {
+    Ok(response) => println!("{}", serde_json::to_string(&response).unwrap()),
+    Err(e) if e.kind() == ErrorKind::ContextWindow => eprintln!("shorten the state: {e}"),
+    Err(e) if e.is_client_error() => eprintln!("rejected: {e}"),
+    Err(e) => eprintln!("engine fault: {e}"),
+}
 # }
 ```
 

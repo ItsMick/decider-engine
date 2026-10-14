@@ -1,5 +1,5 @@
 use decider_engine::{
-    DecisionEngine, InferenceLimits, LoadLimits, NativeEngine, Precision, Request,
+    DecisionEngine, ErrorKind, InferenceLimits, LoadLimits, NativeEngine, Precision, Request,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -60,7 +60,7 @@ fn byte_collection_and_token_budgets_include_exact_boundaries() {
             },
         ),
         (
-            "context window",
+            "per-question tokens",
             InferenceLimits {
                 max_question_tokens: limits.max_question_tokens - 1,
                 ..limits
@@ -81,7 +81,34 @@ fn byte_collection_and_token_budgets_include_exact_boundaries() {
                 .contains(name),
             "{name}"
         );
+        assert_eq!(
+            engine.evaluate(&req, &policy).unwrap_err().kind(),
+            ErrorKind::ResourceLimit,
+            "{name}"
+        );
     }
+}
+
+#[test]
+fn typed_errors_separate_schema_window_model_and_budget_failures() {
+    let engine = NativeEngine::load(fixture()).unwrap();
+    let limits = InferenceLimits::default();
+    let kind = |req: &Request| engine.evaluate(req, &limits).unwrap_err().kind();
+    let mut req = request();
+    req.questions.clear();
+    assert_eq!(kind(&req), ErrorKind::InvalidRequest);
+    let mut req = request();
+    req.state = json!("word ".repeat(300));
+    assert_eq!(kind(&req), ErrorKind::ContextWindow);
+    let mut req = request();
+    req.model = Some("another-model".into());
+    assert_eq!(kind(&req), ErrorKind::ModelMismatch);
+    let mut req = request();
+    req.state = Value::String("x".repeat(limits.max_state_bytes));
+    assert_eq!(kind(&req), ErrorKind::ResourceLimit);
+    let error = engine.evaluate(&req, &limits).unwrap_err();
+    assert!(error.is_client_error());
+    assert_eq!(engine.decide(&req).unwrap_err(), error.to_string());
 }
 
 #[test]
