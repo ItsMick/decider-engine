@@ -9,6 +9,12 @@ mod error;
 mod int8;
 mod limits;
 mod loading;
+#[cfg(all(
+    feature = "arm-neon",
+    target_arch = "aarch64",
+    target_endian = "little"
+))]
+mod neon;
 mod prompt;
 mod qwen;
 pub mod schema;

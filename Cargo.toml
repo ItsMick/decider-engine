@@ -9,6 +9,11 @@ repository = "https://github.com/ItsMick/decider-engine"
 readme = "README.md"
 exclude = [".github/**", "models/**", "*.part", "lambda/**"]
 
+[features]
+# Hand-written NEON kernels on little-endian AArch64; no effect on other
+# targets. Results are bit-identical to the default build.
+arm-neon = []
+
 [dependencies]
 rayon = "1.11"
 safetensors = "0.8"

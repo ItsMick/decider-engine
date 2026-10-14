@@ -43,11 +43,37 @@ impl<const T: usize> Scratch<T> {
     }
 }
 
+/// The 3x3 tile used by projections: NEON registers with `--features arm-neon`
+/// on AArch64, otherwise `dot_tile`. Both are bit-identical to `dot_scores`.
+#[inline(always)]
+fn tile_kernel(xs: [&[f32]; 3], ws: [&[f32]; 3]) -> [[f32; 3]; 3] {
+    #[cfg(all(
+        feature = "arm-neon",
+        target_arch = "aarch64",
+        target_endian = "little"
+    ))]
+    return crate::neon::dot_tile(xs, ws);
+    #[cfg(not(all(
+        feature = "arm-neon",
+        target_arch = "aarch64",
+        target_endian = "little"
+    )))]
+    dot_tile(xs, ws)
+}
+
 /// Nine dot products, rows of `xs` against rows of `ws`. Each keeps the exact
 /// operation order of `dot_scores` (eight lanes, their sum, then the tail), so
 /// results are bit-identical; nine independent accumulator chains let the CPU
 /// overlap them, and each loaded chunk is reused three times.
 #[inline(never)]
+#[cfg_attr(
+    all(
+        feature = "arm-neon",
+        target_arch = "aarch64",
+        target_endian = "little"
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn dot_tile(xs: [&[f32]; 3], ws: [&[f32]; 3]) -> [[f32; 3]; 3] {
     let len = xs[0].len();
     assert!(xs.iter().chain(&ws).all(|v| v.len() == len));
@@ -219,7 +245,7 @@ impl Projection<'_> {
             let mut row = 0;
             if let [w0, w1, w2] = weights[..] {
                 while row + 3 <= rows {
-                    let tile = dot_tile(
+                    let tile = tile_kernel(
                         [tokens[row], tokens[row + 1], tokens[row + 2]],
                         [w0, w1, w2],
                     );
@@ -818,6 +844,34 @@ mod tests {
             let xs = [v(1), v(2), v(3)];
             let ws = [v(4), v(5), v(6)];
             let tile = dot_tile([&xs[0], &xs[1], &xs[2]], [&ws[0], &ws[1], &ws[2]]);
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_eq!(
+                        tile[i][j].to_bits(),
+                        dot_scores(&xs[i], &ws[j]).to_bits(),
+                        "len {len}, ({i}, {j})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_tile_kernel_matches_dot_scores_bit_for_bit() {
+        for len in (0..=40).chain([63, 64, 65, 131, 2048]) {
+            let v = |seed: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| match (i + seed) % 11 {
+                        0 => -0.0,
+                        1 => 1e-30,
+                        2 => -3.5e8,
+                        k => ((i * 37 + seed * 101) % 997) as f32 / 61.0 - 8.0 + k as f32 / 7.0,
+                    })
+                    .collect()
+            };
+            let xs = [v(1), v(2), v(3)];
+            let ws = [v(4), v(5), v(6)];
+            let tile = tile_kernel([&xs[0], &xs[1], &xs[2]], [&ws[0], &ws[1], &ws[2]]);
             for i in 0..3 {
                 for j in 0..3 {
                     assert_eq!(

@@ -9,7 +9,8 @@ rust-version = "1.98"
 [workspace]
 
 [dependencies]
-decider-engine = { path = ".." }
+# ARM-only host: the NEON kernels are bit-identical and a no-op elsewhere.
+decider-engine = { path = "..", features = ["arm-neon"] }
 lambda_runtime = "=1.4.0"
 rayon = "1.11"
 serde = { version = "1", features = ["derive"] }
