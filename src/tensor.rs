@@ -128,6 +128,17 @@ impl Projection<'_> {
     /// Base and LoRA share the final write, which may add a residual or
     /// consume an existing gate. Larger batches retain separate dot passes.
     pub(crate) fn apply(&self, x: &[f32], result: &mut [f32], epilogue: Epilogue) {
+        self.apply_quantized(x, None, result, epilogue);
+    }
+
+    /// `apply` with `x` already quantized for INT8 computation, when available.
+    pub(crate) fn apply_quantized(
+        &self,
+        x: &[f32],
+        quantized: Option<&QuantizedInputs>,
+        result: &mut [f32],
+        epilogue: Epilogue,
+    ) {
         let (input, output) = (self.input, self.output);
         let rows = x.len() / input;
         assert_eq!(x.len(), rows * input);
@@ -149,7 +160,7 @@ impl Projection<'_> {
                 bias: self.bias,
                 adapter: None,
             }
-            .columns(x);
+            .columns_quantized(x, quantized);
             let delta = Projection {
                 input: adapter.rank,
                 output,
@@ -167,58 +178,86 @@ impl Projection<'_> {
                 epilogue,
             );
         } else {
-            let columns = self.columns(x);
+            let columns = self.columns_quantized(x, quantized);
             write_columns(&columns, None, rows, output, result, epilogue);
         }
     }
 
     fn columns(&self, x: &[f32]) -> Vec<f32> {
+        self.columns_quantized(x, None)
+    }
+
+    fn columns_quantized(&self, x: &[f32], quantized: Option<&QuantizedInputs>) -> Vec<f32> {
         if let Data::Quantized {
             bits: 8,
             compute_int8: true,
             ..
         } = self.weights
         {
-            if let Some(columns) = linear_int8(x, self) {
+            if let Some(columns) = linear_int8(x, self, quantized) {
                 return columns;
             }
         }
-        self.columns_tiled::<TILE>(x)
+        if cfg!(feature = "cache-blocking")
+            && x.len() / self.input >= 64
+            && self.input >= 256
+            && self.output >= 24
+        {
+            self.columns_blocked::<24, TILE, 24>(x)
+        } else {
+            self.columns_tiled::<TILE>(x)
+        }
     }
 
     /// Single-dot-product columns when `T` is 1; 3x3 `dot_tile` blocks when `T`
     /// is 3. Both produce bit-identical results.
     fn columns_tiled<const T: usize>(&self, x: &[f32]) -> Vec<f32> {
+        self.columns_blocked::<T, T, { usize::MAX }>(x)
+    }
+
+    /// Keep a row block hot while projecting it against C output columns.
+    /// Every individual dot still uses the original eight-lane reduction.
+    fn columns_blocked<const C: usize, const T: usize, const R: usize>(
+        &self,
+        x: &[f32],
+    ) -> Vec<f32> {
+        assert!(C > 0 && R > 0 && (T == 1 || T == 3) && C.is_multiple_of(T));
         let (input, output) = (self.input, self.output);
         let rows = x.len() / input;
         let tokens: Vec<&[f32]> = x.chunks_exact(input).collect();
-        // Each task computes T adjacent columns for every row.
-        let compute = |group: usize, dst: &mut [f32], scratch: &mut Scratch<T>| {
-            let first = group * T;
+        // Each task owns C adjacent full columns, so writes remain disjoint.
+        let compute = |group: usize, dst: &mut [f32], scratch: &mut Scratch<C>| {
+            let first = group * C;
             let count = dst.len() / rows;
             let weights: Vec<&[f32]> = scratch.weights[..count]
                 .iter_mut()
                 .enumerate()
                 .map(|(j, buf)| self.weights.row((first + j) * input, input, buf))
                 .collect();
-            let mut row = 0;
-            if let [w0, w1, w2] = weights[..] {
-                while row + 3 <= rows {
-                    let tile = dot_tile(
-                        [tokens[row], tokens[row + 1], tokens[row + 2]],
-                        [w0, w1, w2],
-                    );
-                    for (i, values) in tile.iter().enumerate() {
-                        for (j, value) in values.iter().enumerate() {
-                            dst[j * rows + row + i] = *value;
+            for row_start in (0..rows).step_by(R) {
+                let end = row_start.saturating_add(R).min(rows);
+                for col in (0..count).step_by(T) {
+                    let width = T.min(count - col);
+                    let mut row = row_start;
+                    if T == 3 && width == 3 {
+                        while row + 3 <= end {
+                            let tile = dot_tile(
+                                [tokens[row], tokens[row + 1], tokens[row + 2]],
+                                [weights[col], weights[col + 1], weights[col + 2]],
+                            );
+                            for (i, values) in tile.iter().enumerate() {
+                                for (j, value) in values.iter().enumerate() {
+                                    dst[(col + j) * rows + row + i] = *value;
+                                }
+                            }
+                            row += 3;
                         }
                     }
-                    row += 3;
-                }
-            }
-            for row in row..rows {
-                for (j, w) in weights.iter().enumerate() {
-                    dst[j * rows + row] = dot_scores(tokens[row], w);
+                    for row in row..end {
+                        for j in col..col + width {
+                            dst[j * rows + row] = dot_scores(tokens[row], weights[j]);
+                        }
+                    }
                 }
             }
             for (j, column) in dst.chunks_mut(rows).enumerate() {
@@ -239,14 +278,14 @@ impl Projection<'_> {
         let mut columns = vec![0.0; rows * output];
         if rows * output >= 512 {
             columns
-                .par_chunks_mut(rows * T)
+                .par_chunks_mut(rows * C)
                 .enumerate()
                 .for_each_init(Scratch::new, |scratch, (group, dst)| {
                     compute(group, dst, scratch)
                 });
         } else {
             let mut scratch = Scratch::new();
-            for (group, dst) in columns.chunks_mut(rows * T).enumerate() {
+            for (group, dst) in columns.chunks_mut(rows * C).enumerate() {
                 compute(group, dst, &mut scratch);
             }
         }
@@ -292,42 +331,80 @@ pub(crate) fn linear(
     .apply(x, result, Epilogue::Write);
 }
 
-struct QuantizedInputs {
+pub(crate) struct QuantizedInputs {
     values: Vec<i8>,
     scales: Vec<f32>,
 }
 impl QuantizedInputs {
-    fn new(x: &[f32], width: usize) -> Option<Self> {
+    pub(crate) fn new(x: &[f32], width: usize) -> Option<Self> {
         // Preserve FP32 propagation for non-finite inputs rather than silently
         // turning NaNs or infinities into integer zeroes or saturated values.
         if !x.iter().all(|v| v.is_finite()) {
             return None;
         }
+        let groups = width.div_ceil(64);
+        let rows = x.len() / width;
         let mut result = Self {
-            values: Vec::with_capacity(x.len()),
-            scales: Vec::with_capacity(x.len() / width * width.div_ceil(64)),
+            values: vec![0; x.len()],
+            scales: vec![0.0; rows * groups],
         };
-        for row in x.chunks(width) {
-            for group in row.chunks(64) {
+        // Rows are quantized independently, so they can run in parallel.
+        let quantize = |((row, values), scales): ((&[f32], &mut [i8]), &mut [f32])| {
+            for ((group, values), scale) in row.chunks(64).zip(values.chunks_mut(64)).zip(scales) {
                 let max = group.iter().map(|v| v.abs()).fold(0.0, f32::max);
-                let scale = if max == 0.0 {
+                *scale = if max == 0.0 {
                     1.0
                 } else {
                     (max / 127.0).max(f32::MIN_POSITIVE)
                 };
-                result.scales.push(scale);
-                result.values.extend(
-                    group
-                        .iter()
-                        .map(|v| (v / scale).round().clamp(-127.0, 127.0) as i8),
-                );
+                for (q, v) in values.iter_mut().zip(group) {
+                    *q = (v / *scale).round().clamp(-127.0, 127.0) as i8;
+                }
             }
+        };
+        if x.len() >= 1 << 16 && rayon::current_num_threads() > 1 {
+            x.par_chunks(width)
+                .zip(result.values.par_chunks_mut(width))
+                .zip(result.scales.par_chunks_mut(groups))
+                .for_each(quantize);
+        } else {
+            x.chunks(width)
+                .zip(result.values.chunks_mut(width))
+                .zip(result.scales.chunks_mut(groups))
+                .for_each(quantize);
         }
         Some(result)
     }
 }
 
-fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
+/// An activation read by several projections. Its INT8 quantization for
+/// `int8-compute` is made once, on first use, and shared by them all.
+pub(crate) struct SharedInput<'a> {
+    pub x: &'a [f32],
+    width: usize,
+    quantized: std::cell::OnceCell<Option<QuantizedInputs>>,
+}
+impl<'a> SharedInput<'a> {
+    pub(crate) fn new(x: &'a [f32], width: usize) -> Self {
+        Self {
+            x,
+            width,
+            quantized: std::cell::OnceCell::new(),
+        }
+    }
+    /// `None` when the input has non-finite values and must stay FP32.
+    pub(crate) fn quantized(&self) -> Option<&QuantizedInputs> {
+        self.quantized
+            .get_or_init(|| QuantizedInputs::new(self.x, self.width))
+            .as_ref()
+    }
+}
+
+fn linear_int8(
+    x: &[f32],
+    projection: &Projection<'_>,
+    quantized: Option<&QuantizedInputs>,
+) -> Option<Vec<f32>> {
     let (input, output) = (projection.input, projection.output);
     let rows = x.len() / input;
     let Data::Quantized {
@@ -341,9 +418,24 @@ fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
         unreachable!("integer projection requires INT8 weights");
     };
     assert_eq!(*width, input);
-    let inputs = QuantizedInputs::new(x, input)?;
+    let owned;
+    let inputs = match quantized {
+        Some(shared) => {
+            assert_eq!(shared.values.len(), x.len());
+            shared
+        }
+        None => {
+            owned = QuantizedInputs::new(x, input)?;
+            &owned
+        }
+    };
     let groups = input.div_ceil(64);
     let kernel = Kernel::detect();
+    if kernel.tiles(input) {
+        return Some(linear_int8_tiled(
+            inputs, projection, values, scales, &kernel,
+        ));
+    }
     let compute = |column: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
         let w = &values[column * input..(column + 1) * input];
         let w_scales = &scales[column * groups..(column + 1) * groups];
@@ -385,6 +477,82 @@ fn linear_int8(x: &[f32], projection: &Projection<'_>) -> Option<Vec<f32>> {
         }
     }
     Some(columns)
+}
+
+/// `linear_int8` with native dot products: 4x4 blocks of rows and weight rows
+/// share loads and group reductions. Every output equals `Kernel::scaled_dot`
+/// exactly, followed by the same bias and adapter steps as the per-output path.
+fn linear_int8_tiled(
+    inputs: &QuantizedInputs,
+    projection: &Projection<'_>,
+    values: &[u8],
+    scales: &[f32],
+    kernel: &Kernel,
+) -> Vec<f32> {
+    use crate::int8::{TILE_COLUMNS as TC, TILE_ROWS as TR};
+    let (input, output) = (projection.input, projection.output);
+    let groups = input.div_ceil(64);
+    let rows = inputs.values.len() / input;
+    let x: Vec<&[i8]> = inputs.values.chunks_exact(input).collect();
+    let x_scales: Vec<&[f32]> = inputs.scales.chunks_exact(groups).collect();
+    let compute = |block: usize, dst: &mut [f32], scratch: &mut Vec<f32>| {
+        let first = block * TC;
+        let count = dst.len() / rows;
+        let w: Vec<&[u8]> = (first..first + count)
+            .map(|c| &values[c * input..(c + 1) * input])
+            .collect();
+        let w_scales: Vec<&[f32]> = (first..first + count)
+            .map(|c| &scales[c * groups..(c + 1) * groups])
+            .collect();
+        let mut row = 0;
+        if count == TC {
+            while row + TR <= rows {
+                let tile = kernel.scaled_tile(
+                    std::array::from_fn(|r| x[row + r]),
+                    std::array::from_fn(|r| x_scales[row + r]),
+                    std::array::from_fn(|c| w[c]),
+                    std::array::from_fn(|c| w_scales[c]),
+                );
+                for (r, sums) in tile.iter().enumerate() {
+                    for (c, sum) in sums.iter().enumerate() {
+                        dst[c * rows + row + r] = *sum;
+                    }
+                }
+                row += TR;
+            }
+        }
+        for row in row..rows {
+            for c in 0..count {
+                dst[c * rows + row] = kernel.scaled_dot(x[row], x_scales[row], w[c], w_scales[c]);
+            }
+        }
+        for (c, column) in dst.chunks_mut(rows).enumerate() {
+            let adapter = projection
+                .adapter
+                .as_ref()
+                .map(|a| (a, a.weights.row((first + c) * a.rank, a.rank, scratch)));
+            let bias = projection.bias.map_or(0.0, |b| b[first + c]);
+            for (row, value) in column.iter_mut().enumerate() {
+                let base = *value + bias;
+                *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+            }
+        }
+    };
+    let mut columns = vec![0.0; rows * output];
+    if rows * output >= 512 {
+        columns
+            .par_chunks_mut(rows * TC)
+            .enumerate()
+            .for_each_init(Vec::new, |scratch, (block, dst)| {
+                compute(block, dst, scratch)
+            });
+    } else {
+        let mut scratch = Vec::new();
+        for (block, dst) in columns.chunks_mut(rows * TC).enumerate() {
+            compute(block, dst, &mut scratch);
+        }
+    }
+    columns
 }
 
 pub(crate) fn softmax(values: &mut [f32]) {
@@ -518,6 +686,110 @@ mod tests {
     }
 
     #[test]
+    fn integer_projection_tiles_match_per_output_scaled_dots() {
+        let kernel = Kernel::detect();
+        let rank = 3;
+        for (rows, input, output) in [
+            (1usize, 64usize, 4usize),
+            (4, 64, 4),
+            (5, 128, 6),
+            (9, 192, 31),
+            (67, 128, 8),
+            (7, 100, 9),
+        ] {
+            let groups = input.div_ceil(64);
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| ((i * 43 % 255) as f32 - 127.0) / 9.0)
+                .collect();
+            let values: Vec<u8> = (0..output * input).map(|i| (i * 71 + 128) as u8).collect();
+            let scales: Vec<f32> = (0..output * groups)
+                .map(|i| (i % 7 + 1) as f32 / 32.0)
+                .collect();
+            let weights = Data::Quantized {
+                values: values.clone(),
+                scales: scales.clone(),
+                width: input,
+                elements: output * input,
+                bits: 8,
+                compute_int8: true,
+            };
+            let bias: Vec<f32> = (0..output).map(|i| i as f32 / 16.0 - 0.5).collect();
+            let mid: Vec<f32> = (0..rows * rank)
+                .map(|i| (i % 9) as f32 / 4.0 - 1.0)
+                .collect();
+            let adapter_weights =
+                Data::F32((0..output * rank).map(|i| (i % 7) as f32 / 8.0).collect());
+            let projection = Projection {
+                input,
+                output,
+                weights: &weights,
+                bias: Some(&bias),
+                adapter: Some(Adapter {
+                    inputs: &mid,
+                    weights: &adapter_weights,
+                    rank,
+                    scale: 0.375,
+                }),
+            };
+            let actual = projection.columns(&x);
+            let quantized = QuantizedInputs::new(&x, input).unwrap();
+            let mut scratch = Vec::new();
+            for column in 0..output {
+                let a = projection.adapter.as_ref().unwrap();
+                let aw = a.weights.row(column * rank, rank, &mut scratch).to_vec();
+                for row in 0..rows {
+                    let sum = kernel.scaled_dot(
+                        &quantized.values[row * input..(row + 1) * input],
+                        &quantized.scales[row * groups..(row + 1) * groups],
+                        &values[column * input..(column + 1) * input],
+                        &scales[column * groups..(column + 1) * groups],
+                    );
+                    let expected = a.combine(sum + bias[column], row, &aw);
+                    assert_eq!(
+                        actual[column * rows + row].to_bits(),
+                        expected.to_bits(),
+                        "{rows}x{input}->{output} row {row} column {column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_input_quantization_matches_serial_exactly() {
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|t| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(t)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        // Above and below the parallel threshold, with a partial last group.
+        for (rows, width) in [(3, 100), (70, 1000), (40, 2048)] {
+            let x: Vec<f32> = (0..rows * width)
+                .map(|i| match i % 17 {
+                    0 => 0.0,
+                    1 => -1e-38,
+                    k => ((i * 31 % 499) as f32 - 249.0) / k as f32,
+                })
+                .collect();
+            let results: Vec<_> = pools
+                .iter()
+                .map(|p| p.install(|| QuantizedInputs::new(&x, width).unwrap()))
+                .collect();
+            assert_eq!(results[0].values, results[1].values);
+            assert!(results[0]
+                .scales
+                .iter()
+                .zip(&results[1].scales)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert_eq!(results[0].scales.len(), rows * width.div_ceil(64));
+        }
+    }
+
+    #[test]
     fn dynamic_input_quantization_bounds_error_and_preserves_nonfinite_fallback() {
         let width = 131;
         let mut x: Vec<_> = (0..width * 3)
@@ -614,6 +886,12 @@ mod tests {
             (7, 64, 5),
             (19, 131, 31),
             (67, 40, 7),
+            (23, 257, 23),
+            (24, 256, 24),
+            (25, 257, 25),
+            (63, 257, 47),
+            (64, 256, 48),
+            (65, 257, 49),
         ] {
             let x: Vec<f32> = (0..rows * input)
                 .map(|i| ((i * 43 % 113) as f32 - 56.0) / 32.0)
@@ -672,6 +950,9 @@ mod tests {
                         projection.columns(&x),
                         projection.columns_tiled::<1>(&x),
                         projection.columns_tiled::<3>(&x),
+                        projection.columns_blocked::<24, 1, 24>(&x),
+                        projection.columns_blocked::<24, 3, 24>(&x),
+                        projection.columns_blocked::<48, 3, 16>(&x),
                     ] {
                         assert!(
                             actual
@@ -682,6 +963,57 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "real projection cache-blocking sweep; use release and fixed workers"]
+    fn benchmark_projection_blocking() {
+        use std::{hint::black_box, time::Instant};
+        println!(
+            "blocking arch={} workers={}",
+            std::env::consts::ARCH,
+            rayon::current_num_threads()
+        );
+        let tokens: Vec<usize> = std::env::var("PROFILE_TOKENS")
+            .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![64, 512]);
+        for (input, output) in [(2048, 6144), (6144, 2048)] {
+            let weights = Data::Bf16(
+                (0..input * output)
+                    .map(|i| ((((i * 17 % 89) as f32 - 44.0) / 32.0).to_bits() >> 16) as u16)
+                    .collect(),
+            );
+            let p = Projection {
+                input,
+                output,
+                weights: &weights,
+                bias: None,
+                adapter: None,
+            };
+            for &rows in &tokens {
+                let x: Vec<f32> = (0..rows * input)
+                    .map(|i| (i % 31) as f32 / 16.0 - 0.9)
+                    .collect();
+                let expected = p.columns_tiled::<TILE>(&x);
+                let time = |name: &str, f: &mut dyn FnMut() -> Vec<f32>| {
+                    assert_eq!(f(), expected, "{name}");
+                    let start = Instant::now();
+                    for _ in 0..2 {
+                        black_box(f());
+                    }
+                    println!(
+                        "blocking shape={rows}x{input}->{output} plan={name} ms={:.3}",
+                        start.elapsed().as_secs_f64() * 500.0
+                    );
+                };
+                time("original", &mut || p.columns_tiled::<TILE>(&x));
+                time("c12r24", &mut || p.columns_blocked::<12, TILE, 24>(&x));
+                time("c24r24", &mut || p.columns_blocked::<24, TILE, 24>(&x));
+                time("c48r24", &mut || p.columns_blocked::<48, TILE, 24>(&x));
+                time("c48r12", &mut || p.columns_blocked::<48, TILE, 12>(&x));
+                time("c96r24", &mut || p.columns_blocked::<96, TILE, 24>(&x));
             }
         }
     }

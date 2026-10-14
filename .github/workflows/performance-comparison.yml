@@ -1,0 +1,105 @@
+name: Matched CPU performance
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/performance-comparison.yml'
+      - 'src/tensor.rs'
+      - 'examples/compare_logits.rs'
+      - 'scripts/*llama*'
+permissions:
+  contents: read
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: '-C target-cpu=neoverse-n1'
+      RAYON_NUM_THREADS: '4'
+      OMP_NUM_THREADS: '4'
+      LLAMA_REVISION: 6868a52cb337450658006ad2f9281c2eb63f1666
+      BASELINE_REVISION: 2e684576c5f0c44598e65f32d68f66970c419386
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: '1.98.0'
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Install conversion and build dependencies
+        run: |
+          python3 -m venv /tmp/comparison-python
+          /tmp/comparison-python/bin/pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+          /tmp/comparison-python/bin/pip install transformers==5.19.0 numpy safetensors sentencepiece
+          echo /tmp/comparison-python/bin >> "$GITHUB_PATH"
+      - name: Acquire pinned model and llama source
+        run: |
+          python3 scripts/download-model.py models/v21
+          git init /tmp/llama.cpp
+          git -C /tmp/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C /tmp/llama.cpp fetch --depth 1 origin "$LLAMA_REVISION"
+          git -C /tmp/llama.cpp checkout --detach FETCH_HEAD
+      - name: Build pinned main baseline and candidate
+        run: |
+          mkdir -p validation
+          cargo test --release --locked --features cache-blocking --lib
+          git fetch --depth 1 origin "$BASELINE_REVISION"
+          git worktree add --detach /tmp/native-baseline "$BASELINE_REVISION"
+          cp examples/compare_logits.rs /tmp/native-baseline/examples/compare_logits.rs
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked --manifest-path /tmp/native-baseline/Cargo.toml --example compare_logits
+          cp target/release/examples/compare_logits /tmp/decider-baseline
+          cargo build --release --locked --features cache-blocking --example compare_logits
+          cp target/release/examples/compare_logits /tmp/decider-blocked
+      - name: Build llama CPU and convert exact pinned weights
+        run: |
+          cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
+          cmake --build /tmp/llama.cpp/build --target llama -j 4
+          g++ -O3 -std=c++17 -I /tmp/llama.cpp/include -I /tmp/llama.cpp/ggml/include -I /tmp/llama.cpp/vendor scripts/llama-compare.cpp -L /tmp/llama.cpp/build/bin -Wl,-rpath,/tmp/llama.cpp/build/bin -lllama -lggml -lggml-base -o /tmp/llama-compare
+          cp models/v21/tokenizer*.json models/v21/base/
+          python3 /tmp/llama.cpp/convert_hf_to_gguf.py models/v21/base --outtype bf16 --outfile /tmp/base-bf16.gguf > validation/base-conversion.log 2>&1
+          python3 /tmp/llama.cpp/convert_lora_to_gguf.py --base models/v21/base --outtype f32 --outfile /tmp/lora-f32.gguf models/v21/lora > validation/lora-conversion.log 2>&1
+          python3 scripts/prepare-llama-comparison.py models/v21 /tmp/prepared
+      - name: Record environment before serial measurements
+        run: |
+          {
+            uname -a
+            lscpu
+            rustc -Vv
+            cargo -V
+            git rev-parse HEAD
+            git -C /tmp/native-baseline rev-parse HEAD
+            git -C /tmp/llama.cpp rev-parse HEAD
+            cat models/v21/revisions.json
+            cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max
+            python3 -m pip freeze
+            sha256sum /tmp/base-bf16.gguf /tmp/lora-f32.gguf /tmp/prepared/cases.json scripts/llama-compare.cpp
+            grep -E 'GGML_NATIVE:|GGML_CPU_ARM_ARCH:' /tmp/llama.cpp/build/CMakeCache.txt
+          } > validation/environment.txt
+      - name: Serial full-model native baseline, blocked candidate, llama BF16
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('runner', 'scripts/run-llama-comparison.py')
+          runner = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(runner)
+          common = ['models/v21', '/tmp/prepared/cases.json', '3', '4']
+          runner.measure(['/tmp/decider-baseline', *common], Path('validation/baseline'))
+          runner.measure(['/tmp/decider-blocked', *common], Path('validation/blocked'))
+          runner.measure(['/tmp/llama-compare', '/tmp/base-bf16.gguf', '/tmp/lora-f32.gguf', '/tmp/prepared/head.json', '/tmp/prepared/cases.json', '3', '4'], Path('validation/llama-bf16'))
+          PY
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/baseline.jsonl validation/llama-bf16.jsonl > validation/baseline-vs-llama.json
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/blocked.jsonl validation/llama-bf16.jsonl > validation/blocked-vs-llama.json
+          python3 scripts/check-blocking-results.py /tmp/prepared/cases.json validation/baseline.jsonl validation/blocked.jsonl | tee validation/blocking-summary.json
+          cat validation/blocked-vs-llama.json
+      - name: Projection cache-blocking sweep
+        run: cargo test --release --locked --lib benchmark_projection_blocking -- --ignored --nocapture > validation/blocking-sweep.log 2>&1
+      - name: Preserve evidence without weights
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: matched-performance-arm64
+          path: validation/
+          retention-days: 30

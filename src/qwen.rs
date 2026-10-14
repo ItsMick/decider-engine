@@ -1,6 +1,6 @@
 //! Text-only Qwen3.5: full causal GQA and recurrent Gated DeltaNet.
 //! FP32 arithmetic matches the upstream CPU serving path. No generation or KV cache.
-use crate::tensor::{dot_scores, softmax, Epilogue};
+use crate::tensor::{dot_scores, softmax, Epilogue, SharedInput};
 use crate::weights::{Data, Linear, Weights};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -259,6 +259,7 @@ struct Delta {
     a: Linear,
     b: Linear,
     out: Linear,
+    /// Depthwise convolution weights, tap-major: `conv[tap * width + channel]`.
     conv: Vec<f32>,
     dt: Vec<f32>,
     decay_rate: Vec<f32>,
@@ -327,10 +328,13 @@ impl Model {
                     a: linear("linear_attn.in_proj_a", h, c.linear_num_value_heads)?,
                     b: linear("linear_attn.in_proj_b", h, c.linear_num_value_heads)?,
                     out: linear("linear_attn.out_proj", vd, h)?,
-                    conv: w.take(
-                        &format!("{p}.linear_attn.conv1d.weight"),
-                        &[2 * kd + vd, 1, c.linear_conv_kernel_dim],
-                    )?,
+                    conv: tap_major(
+                        &w.take(
+                            &format!("{p}.linear_attn.conv1d.weight"),
+                            &[2 * kd + vd, 1, c.linear_conv_kernel_dim],
+                        )?,
+                        c.linear_conv_kernel_dim,
+                    ),
                     dt: w.take(
                         &format!("{p}.linear_attn.dt_bias"),
                         &[c.linear_num_value_heads],
@@ -480,8 +484,12 @@ impl Model {
                 captured.push(cache);
             }
             residual_norm(&mut x, &mixed, &mut n, &layer.post_norm, c.rms_norm_eps);
-            let mut gate = layer.gate.apply(&n);
-            layer.up.apply_into(&n, &mut gate, Epilogue::SwiGlu);
+            // Gate and up read the same activations; INT8 compute quantizes them once.
+            let input = SharedInput::new(&n, c.hidden_size);
+            let mut gate = layer.gate.apply_shared(&input);
+            layer
+                .up
+                .apply_into_shared(&input, &mut gate, Epilogue::SwiGlu);
             layer.down.apply_into(&gate, &mut x, Epilogue::Add);
         }
         rms(&mut x, &self.norm, c.rms_norm_eps, true);
@@ -530,7 +538,8 @@ impl Full {
         let d = c.head_dim;
         let qw = c.num_attention_heads * d;
         let kw = c.num_key_value_heads * d;
-        let raw_q = self.q.apply(x);
+        let input = SharedInput::new(x, c.hidden_size);
+        let raw_q = self.q.apply_shared(&input);
         let mut q = vec![0.0; n * qw];
         let mut gate = q.clone();
         for t in 0..n {
@@ -541,8 +550,8 @@ impl Full {
                 gate[dst..dst + d].copy_from_slice(&raw_q[src + d..src + 2 * d]);
             }
         }
-        let mut k = self.k.apply(x);
-        let v = self.v.apply(x);
+        let mut k = self.k.apply_shared(&input);
+        let v = self.v.apply_shared(&input);
         rms(&mut q, &self.q_norm, c.rms_norm_eps, true);
         rms(&mut k, &self.k_norm, c.rms_norm_eps, true);
         let half = c.rotary_dim() / 2;
@@ -650,34 +659,16 @@ impl Delta {
         let kd = c.linear_num_key_heads * dk;
         let vd = c.linear_num_value_heads * dv;
         let width = 2 * kd + vd;
-        let raw = self.qkv.apply(x);
-        let z = self.z.apply(x);
-        let a = self.a.apply(x);
-        let b = self.b.apply(x);
-        let mut conv = vec![0.0; raw.len()];
+        let input = SharedInput::new(x, c.hidden_size);
+        let raw = self.qkv.apply_shared(&input);
+        let z = self.z.apply_shared(&input);
+        let a = self.a.apply_shared(&input);
+        let b = self.b.apply_shared(&input);
         let kernel = c.linear_conv_kernel_dim;
         let tail = past.map_or(&[][..], |(tail, _)| tail);
         let tail_rows = tail.len() / width;
         assert_eq!(tail_rows, start.min(kernel - 1));
-        for t in 0..n {
-            let position = start + t;
-            for channel in 0..width {
-                let mut sum = 0.0;
-                for j in 0..kernel {
-                    if position + j + 1 >= kernel {
-                        // Inputs before `start` come from the preceding tokens' tail.
-                        let source = position + j + 1 - kernel;
-                        let value = if source >= start {
-                            raw[(source - start) * width + channel]
-                        } else {
-                            tail[(source + tail_rows - start) * width + channel]
-                        };
-                        sum += value * self.conv[channel * kernel + j];
-                    }
-                }
-                conv[t * width + channel] = silu(sum);
-            }
-        }
+        let conv = convolve(&raw, tail, start, width, kernel, &self.conv);
         let mut state = past.map_or_else(
             || vec![0.0; c.linear_num_value_heads * dk * dv],
             |(_, state)| state.to_vec(),
@@ -701,6 +692,67 @@ impl Delta {
         next_tail.extend_from_slice(&raw[(n - (keep - from_tail)) * width..]);
         (self.out.apply(&out), next_tail, state)
     }
+}
+
+/// Checkpoint `[channel][1][tap]` convolution weights as `[tap][channel]`.
+fn tap_major(weights: &[f32], kernel: usize) -> Vec<f32> {
+    let width = weights.len() / kernel;
+    (0..kernel * width)
+        .map(|i| weights[(i % width) * kernel + i / width])
+        .collect()
+}
+
+/// Causal depthwise convolution with SiLU over `raw` (`n` rows of `width`
+/// channels) for tokens at positions `start..start + n`; inputs before `start`
+/// come from `tail`, the preceding tokens' last rows. `taps` is tap-major.
+///
+/// Each channel's sum starts at zero and adds `input * weight` tap by tap in
+/// order, skipping taps before the sequence start, as a scalar loop would. Rows
+/// are independent, so they run in parallel, and channels vectorize.
+fn convolve(
+    raw: &[f32],
+    tail: &[f32],
+    start: usize,
+    width: usize,
+    kernel: usize,
+    taps: &[f32],
+) -> Vec<f32> {
+    let n = raw.len() / width;
+    let tail_rows = tail.len() / width;
+    assert_eq!(taps.len(), kernel * width);
+    let row = |t: usize, out: &mut [f32]| {
+        let position = start + t;
+        for (j, weights) in taps.chunks_exact(width).enumerate() {
+            if position + j + 1 < kernel {
+                continue;
+            }
+            // Inputs before `start` come from the preceding tokens' tail.
+            let source = position + j + 1 - kernel;
+            let input = if source >= start {
+                &raw[(source - start) * width..(source - start + 1) * width]
+            } else {
+                let row = source + tail_rows - start;
+                &tail[row * width..(row + 1) * width]
+            };
+            for ((sum, x), w) in out.iter_mut().zip(input).zip(weights) {
+                *sum += x * w;
+            }
+        }
+        for sum in out.iter_mut() {
+            *sum = silu(*sum);
+        }
+    };
+    let mut conv = vec![0.0; raw.len()];
+    if n * width >= 1 << 16 && rayon::current_num_threads() > 1 {
+        conv.par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(t, out)| row(t, out));
+    } else {
+        conv.chunks_mut(width)
+            .enumerate()
+            .for_each(|(t, out)| row(t, out));
+    }
+    conv
 }
 
 /// Shapes and per-head constants of the Gated DeltaNet recurrence.
@@ -862,6 +914,255 @@ mod tests {
             .validate_layout(4096, 4096, 4, &limits)
             .unwrap_err()
             .contains("budget"));
+    }
+
+    /// Per-operator timing of one DeltaNet layer, one full-attention layer and
+    /// their MLPs at the Qwen3.5-2B dimensions, with synthetic BF16 weights and
+    /// rank-16 F32 adapters. Prints one line per operator.
+    #[test]
+    #[ignore = "real-size operator profile; run with --release and a fixed RAYON_NUM_THREADS"]
+    fn profile_layer_operators() {
+        use crate::Precision;
+        use std::{hint::black_box, time::Instant};
+        let (h, inter, rank) = (2048, 6144, 16);
+        let (heads, kv_heads, head_dim) = (8, 2, 256);
+        let (lk, lv, dk, dv, kernel) = (16, 16, 128, 128, 4);
+        let (kd, vd) = (lk * dk, lv * dv);
+        let tokens: Vec<usize> = std::env::var("PROFILE_TOKENS")
+            .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![64, 512, 2048]);
+        let modes = [Precision::Checkpoint, Precision::Int8Compute];
+        println!(
+            "profile arch={} workers={}",
+            std::env::consts::ARCH,
+            rayon::current_num_threads()
+        );
+        let time = |label: &str, precision: Precision, n: usize, f: &mut dyn FnMut()| {
+            f();
+            let start = Instant::now();
+            for _ in 0..2 {
+                f();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1000.0 / 2.0;
+            println!("profile precision={precision:?} tokens={n} op={label} ms={ms:.2}");
+        };
+        for precision in modes {
+            let lin = |i, o, seed| Linear::synthetic(i, o, rank, seed, precision);
+            let delta = Delta {
+                qkv: lin(h, 2 * kd + vd, 1),
+                z: lin(h, vd, 2),
+                a: lin(h, lv, 3),
+                b: lin(h, lv, 4),
+                out: lin(vd, h, 5),
+                conv: (0..(2 * kd + vd) * kernel)
+                    .map(|i| (i % 7) as f32 / 9.0 - 0.3)
+                    .collect(),
+                dt: vec![0.1; lv],
+                decay_rate: vec![-0.5; lv],
+                norm: vec![1.0; dv],
+            };
+            let full = Full {
+                q: lin(h, heads * head_dim * 2, 6),
+                k: lin(h, kv_heads * head_dim, 7),
+                v: lin(h, kv_heads * head_dim, 8),
+                o: lin(heads * head_dim, h, 9),
+                q_norm: vec![0.1; head_dim],
+                k_norm: vec![0.1; head_dim],
+            };
+            let (gate, up, down) = (lin(h, inter, 10), lin(h, inter, 11), lin(inter, h, 12));
+            for &n in &tokens {
+                let x: Vec<f32> = (0..n * h)
+                    .map(|i| ((i * 43 % 113) as f32 - 56.0) / 64.0)
+                    .collect();
+                let raw = delta.qkv.apply(&x);
+                let (a, b, z) = (delta.a.apply(&x), delta.b.apply(&x), delta.z.apply(&x));
+                let conv = convolve(&raw, &[], 0, 2 * kd + vd, kernel, &delta.conv);
+                let recurrence = Recurrence {
+                    key_heads: lk,
+                    value_heads: lv,
+                    dk,
+                    dv,
+                    eps: 1e-6,
+                    decay_rate: &delta.decay_rate,
+                    dt: &delta.dt,
+                    norm: &delta.norm,
+                };
+                let mixed: Vec<f32> = (0..n * vd).map(|i| (i % 5) as f32 / 5.0).collect();
+                time("delta.in_proj_qkv", precision, n, &mut || {
+                    black_box(delta.qkv.apply(&x));
+                });
+                time("delta.in_proj_z", precision, n, &mut || {
+                    black_box(delta.z.apply(&x));
+                });
+                time("delta.in_proj_a+b", precision, n, &mut || {
+                    black_box((delta.a.apply(&x), delta.b.apply(&x)));
+                });
+                time("delta.conv1d", precision, n, &mut || {
+                    black_box(convolve(&raw, &[], 0, 2 * kd + vd, kernel, &delta.conv));
+                });
+                time("delta.recurrence", precision, n, &mut || {
+                    let mut state = vec![0.0; lv * dk * dv];
+                    black_box(recurrence.run(&conv, &a, &b, &z, &mut state));
+                });
+                time("delta.out_proj", precision, n, &mut || {
+                    black_box(delta.out.apply(&mixed));
+                });
+                let c = Config {
+                    hidden_size: h,
+                    intermediate_size: inter,
+                    num_hidden_layers: 1,
+                    vocab_size: 1,
+                    layer_types: vec!["full_attention".into()],
+                    num_attention_heads: heads,
+                    num_key_value_heads: kv_heads,
+                    head_dim,
+                    rms_norm_eps: 1e-6,
+                    linear_conv_kernel_dim: kernel,
+                    linear_key_head_dim: dk,
+                    linear_value_head_dim: dv,
+                    linear_num_key_heads: lk,
+                    linear_num_value_heads: lv,
+                    rope_parameters: Rope {
+                        rope_theta: 1e7,
+                        partial_rotary_factor: 0.25,
+                        rope_type: "default".into(),
+                    },
+                    attention_bias: false,
+                    attn_output_gate: true,
+                    hidden_act: "silu".into(),
+                };
+                time("delta.layer_mixer_total", precision, n, &mut || {
+                    black_box(delta.forward(&x, &c, 0, None));
+                });
+                let angles: Vec<(f32, f32)> =
+                    (0..n * 32).map(|i| (i as f32 / 1000.0).sin_cos()).collect();
+                let (q, k, v) = (
+                    (0..n * heads * head_dim)
+                        .map(|i| (i % 11) as f32 / 11.0)
+                        .collect::<Vec<f32>>(),
+                    (0..n * kv_heads * head_dim)
+                        .map(|i| (i % 13) as f32 / 13.0)
+                        .collect::<Vec<f32>>(),
+                    (0..n * kv_heads * head_dim)
+                        .map(|i| (i % 7) as f32 / 7.0)
+                        .collect::<Vec<f32>>(),
+                );
+                let attended: Vec<f32> = (0..n * heads * head_dim)
+                    .map(|i| (i % 3) as f32 / 3.0)
+                    .collect();
+                time("full.q_proj", precision, n, &mut || {
+                    black_box(full.q.apply(&x));
+                });
+                time("full.k+v_proj", precision, n, &mut || {
+                    black_box((full.k.apply(&x), full.v.apply(&x)));
+                });
+                time("full.attention_core", precision, n, &mut || {
+                    black_box(causal_attention(&q, &k, &v, heads, kv_heads, head_dim, 0));
+                });
+                time("full.o_proj", precision, n, &mut || {
+                    black_box(full.o.apply(&attended));
+                });
+                time("full.layer_mixer_total", precision, n, &mut || {
+                    black_box(full.forward(&x, &c, &angles, None));
+                });
+                time("mlp.gate+up+down", precision, n, &mut || {
+                    let mut g = gate.apply(&x);
+                    up.apply_into(&x, &mut g, Epilogue::SwiGlu);
+                    let mut residual = x.clone();
+                    down.apply_into(&g, &mut residual, Epilogue::Add);
+                    black_box(residual);
+                });
+                time("norms(2x rms)", precision, n, &mut || {
+                    let mut t = x.clone();
+                    rms(&mut t, &vec![0.1; h], 1e-6, true);
+                    rms(&mut t, &vec![0.1; h], 1e-6, true);
+                    black_box(t);
+                });
+            }
+        }
+    }
+
+    /// The original channel-by-channel convolution over checkpoint-layout weights.
+    fn reference_convolve(
+        raw: &[f32],
+        tail: &[f32],
+        start: usize,
+        width: usize,
+        kernel: usize,
+        weights: &[f32],
+    ) -> Vec<f32> {
+        let n = raw.len() / width;
+        let tail_rows = tail.len() / width;
+        let mut conv = vec![0.0; raw.len()];
+        for t in 0..n {
+            let position = start + t;
+            for channel in 0..width {
+                let mut sum = 0.0;
+                for j in 0..kernel {
+                    if position + j + 1 >= kernel {
+                        let source = position + j + 1 - kernel;
+                        let value = if source >= start {
+                            raw[(source - start) * width + channel]
+                        } else {
+                            tail[(source + tail_rows - start) * width + channel]
+                        };
+                        sum += value * weights[channel * kernel + j];
+                    }
+                }
+                conv[t * width + channel] = silu(sum);
+            }
+        }
+        conv
+    }
+
+    #[test]
+    fn vectorized_convolution_matches_channel_loop_exactly() {
+        let pools: Vec<_> = [1, 4]
+            .into_iter()
+            .map(|t| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(t)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let value = |i: usize, m: usize| match i % 13 {
+            0 => -0.0,
+            1 => 1e-30,
+            k => ((i * m % 997) as f32 - 498.0) / (k as f32 * 9.0),
+        };
+        // Widths on both sides of the parallel threshold; sequences shorter than
+        // the kernel; continuations after 0, 1, 2 and 3 tail rows.
+        for (width, kernel) in [(5, 4), (64, 4), (6144, 4), (7, 1), (9, 3)] {
+            let weights: Vec<f32> = (0..width * kernel).map(|i| value(i, 31)).collect();
+            let taps = tap_major(&weights, kernel);
+            for (start, n) in [
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 17),
+                (1, 4),
+                (2, 1),
+                (3, 5),
+                (9, 12),
+            ] {
+                let tail_rows = start.min(kernel - 1);
+                let tail: Vec<f32> = (0..tail_rows * width).map(|i| value(i, 17)).collect();
+                let raw: Vec<f32> = (0..n * width).map(|i| value(i, 43)).collect();
+                let expected = reference_convolve(&raw, &tail, start, width, kernel, &weights);
+                for pool in &pools {
+                    let actual =
+                        pool.install(|| convolve(&raw, &tail, start, width, kernel, &taps));
+                    assert!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "width {width}, kernel {kernel}, start {start}, n {n}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

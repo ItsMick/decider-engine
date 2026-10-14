@@ -9,6 +9,10 @@ repository = "https://github.com/ItsMick/decider-engine"
 readme = "README.md"
 exclude = [".github/**", "models/**", "*.part", "lambda/**"]
 
+[features]
+# Experimental until matched ARM end-to-end measurements establish the gain.
+cache-blocking = []
+
 [dependencies]
 rayon = "1.11"
 safetensors = "0.8"
