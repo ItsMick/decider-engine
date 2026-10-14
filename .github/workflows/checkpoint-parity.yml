@@ -47,7 +47,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          cargo build --release --locked --tests
+          start=$SECONDS
           cargo test --release --locked --test model -- --ignored --nocapture 2>&1 | tee validation/parity.log
+          # Wall time of the real-weight test alone (build excluded), for comparing releases.
+          echo "parity_test_seconds=$((SECONDS - start))" | tee -a validation/environment.txt
       - name: Preserve validation evidence (no weights)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
