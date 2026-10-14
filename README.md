@@ -26,6 +26,8 @@ target/release/decider-engine models/v21 tests/request.json
 
 The downloader pins the adapter and base revisions and checks the published
 SHA256 hashes of weight files. It also downloads their license files.
+Rerun it to resume an interrupted download; a partial or mismatched file is
+downloaded again once from scratch before the script reports an error.
 It downloads approximately 4.5 GB; allow 8 GB available RAM for initial loading
 and inference. Checkpoint weights retain their original BF16/F16/F32 storage;
 checkpoint arithmetic, adapters, normalization, recurrent state, and pointer
