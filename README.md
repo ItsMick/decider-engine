@@ -34,8 +34,13 @@ The v21 model occupies roughly 4 GB resident memory. Loading streams tensors
 through a bounded buffer instead of holding a second copy of the checkpoint.
 
 With no request file, stdin accepts one JSON request per line and stdout returns
-one response per line. The model stays loaded until EOF. Blank lines are skipped;
-invalid requests stop the process with an error on stderr and a nonzero exit status.
+one response per line. The model stays loaded until EOF. Invalid requests, including
+blank lines, produce `{"error":{"kind":"invalid_request","message":"..."}}`
+(or `limit`/`context_window`) and processing continues in input order. Oversized
+lines are drained through their newline before the next request. The 2 MiB limit
+excludes LF or CRLF framing. Only engine faults and I/O failures terminate the
+resident process; file mode still fails with stderr and a nonzero exit status.
+`--precision` may appear before or after paths; use `--` to end option parsing.
 The CLI limits each request to 2 MiB.
 
 ```json
@@ -71,6 +76,33 @@ For a Git dependency:
 ```toml
 decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.2.2" }
 ```
+
+## Serving errors and model identity
+
+`NativeEngine::decide_checked` and `decide_with_limits_checked` return
+`DecideError::{InvalidRequest, Limit, ContextWindow, Engine}`. Hosts can match
+variants or call `kind()` and `is_request_error()` without parsing messages.
+The existing `DecisionEngine::decide` and `decide_with_limits` APIs retain their
+`Result<_, String>` signatures for compatibility. All admission checks still
+finish before the first forward pass.
+
+A precision-specific model ID is accepted only by that precision. Omitting the
+ID or using `strands-decider-latest` selects the already-loaded engine. The
+`strands-decider-2B-hobson-v21` alias additionally requires `revisions.json` to
+declare both pinned base and adapter revisions; it is a revision alias usable
+with any selected precision. `checkpoint_revision()` exposes this optional
+metadata. It is a declaration, not cryptographic verification of tensor bytes;
+use the hash-verifying downloader before trusting a checkpoint. Missing metadata
+is allowed, while malformed metadata is rejected at load. Synthetic checkpoints
+without revisions cannot answer under the v21 alias.
+
+The downloader resumes interrupted transfers. Bad partial bytes are removed and
+retried once from zero, including rejected HTTP ranges. A corrupt existing file
+is moved to a unique `.corrupt-*` sibling and downloaded again. Remove quarantine
+files after diagnosis; they are not used for inference. The Unix `flock` lock is
+released by the OS when the process exits or is killed; leftover PID text never
+blocks a later run. Concurrent writers receive a clear error. Do not unlink the
+lock while another downloader is running.
 
 ## Scope and checks
 

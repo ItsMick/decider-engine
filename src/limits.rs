@@ -1,5 +1,5 @@
 //! Serving limits are independent of the checkpoint's trained context window.
-use crate::{Question, Request};
+use crate::{DecideError, Question, Request};
 use serde::Serialize;
 use std::io::{self, Write};
 
@@ -44,6 +44,16 @@ impl InferenceLimits {
 
     /// Validate byte/collection budgets before rendering or tokenization.
     pub fn validate(&self, request: &Request) -> Result<(), String> {
+        self.validate_checked(request).map_err(|e| e.to_string())
+    }
+
+    /// Typed variant of `validate`, distinguishing budgets from schema errors.
+    pub fn validate_checked(&self, request: &Request) -> Result<(), DecideError> {
+        self.validate_budgets(request).map_err(DecideError::Limit)?;
+        request.validate().map_err(DecideError::InvalidRequest)
+    }
+
+    fn validate_budgets(&self, request: &Request) -> Result<(), String> {
         check(
             "question count",
             request.questions.len(),
@@ -87,7 +97,7 @@ impl InferenceLimits {
         }
         json_budget(&request.state, self.max_state_bytes, "state bytes")?;
         json_budget(request, self.max_request_bytes, "request bytes")?;
-        request.validate()
+        Ok(())
     }
 
     pub(crate) fn add_tokens(&self, total: usize, tokens: usize) -> Result<usize, String> {

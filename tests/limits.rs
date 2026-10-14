@@ -60,7 +60,7 @@ fn byte_collection_and_token_budgets_include_exact_boundaries() {
             },
         ),
         (
-            "context window",
+            "per-question tokens",
             InferenceLimits {
                 max_question_tokens: limits.max_question_tokens - 1,
                 ..limits

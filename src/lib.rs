@@ -4,7 +4,9 @@
 //! Loading never downloads or executes Python. Requests over the trained window
 //! are rejected in full rather than silently losing state or options.
 #![deny(unsafe_code)]
+#![doc = include_str!("../README.md")]
 
+mod error;
 mod int8;
 mod limits;
 mod loading;
@@ -15,6 +17,7 @@ mod tensor;
 mod weights;
 
 use crate::tensor::{dot_scores, softmax};
+pub use error::DecideError;
 pub use limits::InferenceLimits;
 pub use loading::LoadLimits;
 pub use schema::{Answer, Question, Request, Response};
@@ -117,7 +120,16 @@ pub struct NativeEngine {
     head: Head,
     config: DeciderConfig,
     precision: Precision,
+    checkpoint_revision: Option<CheckpointRevision>,
 }
+/// Revisions declared by the checkpoint's optional revisions.json. This metadata
+/// is not a weight-integrity attestation; verify files with the pinned downloader.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CheckpointRevision {
+    pub decider: String,
+    pub base: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Encoding {
     pub input_ids: Vec<u32>,
@@ -153,8 +165,26 @@ impl NativeEngine {
         request: &Request,
         limits: &InferenceLimits,
     ) -> Result<Response, String> {
+        self.decide_with_limits_checked(request, limits)
+            .map_err(|e| e.to_string())
+    }
+    /// Typed serving API for hosts that distinguish client rejection from faults.
+    pub fn decide_checked(&self, request: &Request) -> Result<Response, DecideError> {
+        self.decide_with_limits_checked(request, &InferenceLimits::default())
+    }
+
+    pub fn decide_with_limits_checked(
+        &self,
+        request: &Request,
+        limits: &InferenceLimits,
+    ) -> Result<Response, DecideError> {
         self.decide_bounded(request, limits)
     }
+
+    pub fn checkpoint_revision(&self) -> Option<&CheckpointRevision> {
+        self.checkpoint_revision.as_ref()
+    }
+
     /// `dir` holds a Strands export and a `base/` directory with Qwen weights.
     pub fn load(dir: &Path) -> Result<Self, String> {
         Self::load_with_precision(dir, Precision::Checkpoint)
@@ -170,6 +200,20 @@ impl NativeEngine {
         precision: Precision,
         limits: &LoadLimits,
     ) -> Result<Self, String> {
+        let revision_path = dir.join("revisions.json");
+        let checkpoint_revision = if revision_path.try_exists().map_err(|e| e.to_string())? {
+            let revision: CheckpointRevision = serde_json::from_value(json(&revision_path)?)
+                .map_err(|e| format!("invalid checkpoint revisions: {e}"))?;
+            if [&revision.decider, &revision.base]
+                .iter()
+                .any(|r| r.len() != 40 || !r.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err("checkpoint revisions must be 40-character Git SHA values".into());
+            }
+            Some(revision)
+        } else {
+            None
+        };
         let config_path = if dir.join("strands_decider_config.json").exists() {
             dir.join("strands_decider_config.json")
         } else {
@@ -268,6 +312,7 @@ impl NativeEngine {
             head,
             config,
             precision,
+            checkpoint_revision,
         })
     }
     pub fn max_length(&self) -> usize {
@@ -278,7 +323,7 @@ impl NativeEngine {
         schema::content(state, false)?;
         question.validate()?;
         let rendered = prompt::render(question);
-        encode(&self.tokenizer, state, &rendered, self.config.max_length)
+        encode(&self.tokenizer, state, &rendered, self.config.max_length).map_err(|e| e.to_string())
     }
     /// Run an already bound prompt through the native torso and pointer head.
     pub fn raw_logits(&self, encoded: &Encoding) -> Result<Vec<f32>, String> {
@@ -303,16 +348,21 @@ fn encode(
     state: &Value,
     rendered: &prompt::Rendered,
     max_length: usize,
-) -> Result<Encoding, String> {
+) -> Result<Encoding, DecideError> {
     // Strands tokenizes the prefix and question independently, then concatenates.
     let prefix = format!("<state>\n{}\n</state>\n", prompt::render_content(state));
-    let s = tokenizer.encode(prefix, true).map_err(|e| e.to_string())?;
+    let s = tokenizer
+        .encode(prefix, true)
+        .map_err(|e| DecideError::Engine(e.to_string()))?;
     let q = tokenizer
         .encode(rendered.text.as_str(), false)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| DecideError::Engine(e.to_string()))?;
     let total = s.len() + q.len();
     if total > max_length {
-        return Err(format!("prompt of {total} tokens exceeds context window of {max_length}; shorten the state or question"));
+        return Err(DecideError::ContextWindow {
+            tokens: total,
+            limit: max_length,
+        });
     }
     let mut positions = Vec::new();
     for (start, end) in &rendered.spans {
@@ -323,7 +373,9 @@ fn encode(
             .filter(|(_, (lo, hi))| hi > lo && lo >= start && hi <= end)
             .map(|(i, _)| i)
             .next_back()
-            .ok_or("option has no tokens in its span")?;
+            .ok_or_else(|| {
+                DecideError::InvalidRequest("option has no tokens in its span".into())
+            })?;
         positions.push(s.len() + index);
     }
     let ids = s.get_ids().iter().chain(q.get_ids()).copied().collect();
@@ -338,7 +390,7 @@ impl DecisionEngine for NativeEngine {
         self.precision.engine_id()
     }
     fn decide(&self, request: &Request) -> Result<Response, String> {
-        self.decide_bounded(request, &InferenceLimits::default())
+        self.decide_checked(request).map_err(|e| e.to_string())
     }
 }
 
@@ -347,15 +399,20 @@ impl NativeEngine {
         &self,
         request: &Request,
         limits: &InferenceLimits,
-    ) -> Result<Response, String> {
-        limits.validate(request)?;
+    ) -> Result<Response, DecideError> {
+        limits.validate_checked(request)?;
+        let pinned_v21 = self.checkpoint_revision.as_ref().is_some_and(|r| {
+            r.decider == "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5"
+                && r.base == "b1485b2fa6dfa1287294f269f5fb618e03d52d7c"
+        });
         if request.model.as_deref().is_some_and(|m| {
             m != self.model()
-                && m != ENGINE_ID
                 && m != "strands-decider-latest"
-                && m != "strands-decider-2B-hobson-v21"
+                && !(m == "strands-decider-2B-hobson-v21" && pinned_v21)
         }) {
-            return Err("requested model is not this native engine".into());
+            return Err(DecideError::InvalidRequest(
+                "requested model or revision is not this native engine".into(),
+            ));
         }
         // Validate and bind every question before spending CPU on any of them.
         let mut total_tokens = 0;
@@ -368,16 +425,18 @@ impl NativeEngine {
                     &self.tokenizer,
                     &request.state,
                     &rendered,
-                    self.max_length().min(limits.max_question_tokens),
+                    self.max_length(),
                 )?;
-                total_tokens = limits.add_tokens(total_tokens, enc.input_ids.len())?;
+                total_tokens = limits
+                    .add_tokens(total_tokens, enc.input_ids.len())
+                    .map_err(DecideError::Limit)?;
                 Ok((name, q, rendered, enc))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, DecideError>>()?;
         let mut input_tokens = 0;
         let mut answers = BTreeMap::new();
         for (name, q, rendered, enc) in encoded {
-            let mut logits = self.raw_logits(&enc)?;
+            let mut logits = self.raw_logits(&enc).map_err(DecideError::Engine)?;
             let temperature = self
                 .config
                 .temperature_by_kind
@@ -389,7 +448,9 @@ impl NativeEngine {
             }
             softmax(&mut logits);
             if logits.iter().any(|p| !p.is_finite()) {
-                return Err("non-finite decision probabilities".into());
+                return Err(DecideError::Engine(
+                    "non-finite decision probabilities".into(),
+                ));
             }
             answers.insert(
                 name.clone(),
