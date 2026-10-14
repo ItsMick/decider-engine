@@ -63,7 +63,9 @@ by the download script, records the pinned Strands and Qwen revisions.
 `criteria` as an ordered JSON object mapping option labels to descriptions or
 `null`. For `score`, supply an array of 2–10 descriptions from lowest to highest;
 the answer is an expected zero-based level. See [tests/request.json](tests/request.json).
-State and instructions accept strings, objects, or arrays. Option order is preserved.
+State and instructions accept strings, objects, or arrays. Option order is preserved
+in the prompt, where it fixes each option's binding; response JSON objects are
+sorted by key (see [compatibility](#compatibility-with-upstream-strands)).
 
 ## Library
 
@@ -192,6 +194,29 @@ remain. Batches of at least 64 tokens keep base and adapter dot passes separate;
 smaller batches interleave them. The floating-point arithmetic order is preserved.
 Scalar INT8 compute retains a separate projection plan after benchmarking showed
 a cost for fusion on that fallback. Native ARM INT8 compute uses fused writes.
+
+### Compatibility with upstream Strands
+
+Prompt rendering and token binding match upstream `prompting.py` at the pinned
+hashes, and tests check them against upstream-generated fixtures. The one exception
+is integer literals outside the 64-bit range and a bare `-0`, which `serde_json`
+parses as floats. Model arithmetic matches the pinned PyTorch reference within the
+documented tolerances. The request and response envelope differs from the upstream
+server (`strands_decider.infer`) in these deliberate ways:
+
+| Behaviour | decider-engine | Upstream server |
+| --- | --- | --- |
+| `noul`, `score`, `probabilities`, `confidence` | Unrounded FP32 | Rounded to 4 decimals |
+| `usage.input_tokens` | Each question's bound tokens, summed: the state counts once per question | The state counts once per request when its prefix cache runs |
+| `usage.output_tokens` | `0` | One per question |
+| Unknown request or question fields | Rejected | Ignored |
+| Question without `type` | Rejected | Parsed as `noul` |
+| Key order of `answers`, `probabilities`, `legend` | Sorted by key | Request and option order |
+| Prompt over the context window | Rejected, like upstream's `strict_window` | Truncates the state, and very long questions from the front, by default |
+| Response `model` | Engine ID with precision suffix | Configured model name |
+
+Clients that read answers by key, and send only documented fields with an
+explicit `type`, see the same decisions from both.
 
 ## Lower precision and ARM64 Lambda
 
