@@ -5,11 +5,18 @@ No Python inference dependencies. Downloads are explicit, resumable, and atomic;
 the native runtime never downloads anything during inference or model load.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+
+try:
+    import fcntl
+except ImportError:  # Windows: fall back to an exclusive-create lock file.
+    fcntl = None
 
 DECIDER = "StrandsAgents/strands-decider-2B-hobson-v21"
 REVISION = "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5"
@@ -22,13 +29,49 @@ def fetch(repo, rev, name, dest, digest=None):
     if dest.exists():
         if digest is None or sha256(dest) == digest:
             return
-        raise RuntimeError(f"checksum mismatch: {dest}")
+        print(f"{dest}: checksum mismatch; downloading it again", file=sys.stderr)
+        dest.unlink()
     scratch = dest.with_name(dest.name + ".part")
-    subprocess.run(["curl", "-fL", "--retry", "2", "-C", "-", "-o", str(scratch),
-                    f"https://huggingface.co/{repo}/resolve/{rev}/{name}"], check=True)
-    if digest and sha256(scratch) != digest:
-        raise RuntimeError(f"checksum mismatch: {scratch}")
-    scratch.replace(dest)
+    url = f"https://huggingface.co/{repo}/resolve/{rev}/{name}"
+    for attempt in range(2):
+        # The first attempt resumes an existing .part; the second always starts over.
+        try:
+            subprocess.run(["curl", "-fL", "--retry", "2", "-C", "-", "-o", str(scratch), url],
+                           check=True)
+        except subprocess.CalledProcessError:
+            if attempt or not scratch.exists():
+                raise
+        else:
+            if digest is None or sha256(scratch) == digest:
+                scratch.replace(dest)
+                return
+        # A partial file can hold bytes from an interrupted or superseded download.
+        scratch.unlink(missing_ok=True)
+    raise RuntimeError(f"checksum mismatch after a fresh download of {name} from {repo}@{rev}")
+
+
+@contextmanager
+def exclusive(root):
+    """Hold the download lock; the operating system releases it if the process dies."""
+    lock = root / ".pull.lock"
+    if fcntl is None:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            raise SystemExit(f"{lock} exists: another download may be running; "
+                             "delete it if not") from None
+        try:
+            yield
+        finally:
+            os.close(fd)
+            lock.unlink()
+        return
+    with lock.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"another download is already running in {root}") from None
+        yield
 
 
 def sha256(path):
@@ -41,12 +84,9 @@ def main():
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     root = args.directory
-    # Multiple writers must not share a resumable .part file.
     root.mkdir(parents=True, exist_ok=True)
-    lock = root / ".pull.lock"
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.write(fd, str(os.getpid()).encode())
+    # Multiple writers must not share a resumable .part file.
+    with exclusive(root):
         files = ["strands_decider_config.json", "provenance.json", "MANIFEST.sha256",
                  "LICENSE.md", "tokenizer.json", "tokenizer_config.json",
                  "head.safetensors", "lora/adapter_config.json", "lora/adapter_model.safetensors"]
@@ -79,9 +119,6 @@ def main():
             fetch(BASE, BASE_REVISION, name, root / "base" / name, digest)
         (root / "revisions.json").write_text(json.dumps({"decider": REVISION, "base": BASE_REVISION}, indent=2) + "\n")
         print(root)
-    finally:
-        os.close(fd)
-        lock.unlink()
 
 
 if __name__ == "__main__":
