@@ -107,8 +107,10 @@ decider-engine = { git = "https://github.com/ItsMick/decider-engine", tag = "v0.
 
 ## Scope and checks
 
-Text only, CPU only, no generation or prefix/KV cache. Each
-question gets a separate forward pass. Prompts exceeding the checkpoint's
+Text only, CPU only, no generation. With two or more questions, the shared
+`<state>` prefix runs once per request; each question then continues from its
+cached attention keys/values and DeltaNet state. This reproduces separate
+forward passes bit-for-bit. Prompts exceeding the checkpoint's
 4096-token window are rejected without truncation. Use trusted checkpoints;
 the loader validates tensor shapes and uses safetensors, but does not sandbox
 malicious files or enforce a process memory/time budget. Library inference and
@@ -119,8 +121,9 @@ Decisions and confidence can be wrong.
 
 `decide()` applies `InferenceLimits::default()` before prompt rendering and
 tokenization, then checks every bound prompt before any forward pass. An error
-rejects the whole request. Question tokens include the repeated state and template;
-the sum limits aggregate work across separate forward passes.
+rejects the whole request. Question tokens include the state and template, as
+if each question ran alone, and the sum bounds aggregate work. With the shared
+prefix, actual work is lower: the state runs once.
 
 | Budget | Default | `InferenceLimits::lambda()` |
 | --- | ---: | ---: |

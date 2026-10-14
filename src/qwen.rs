@@ -401,10 +401,35 @@ impl Model {
         })
     }
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        Ok(self.run(ids, None, false)?.0)
+    }
+
+    /// Run a token prefix and keep what later tokens need from it. Hidden states
+    /// of the prefix are checked exactly as in `forward`, then discarded.
+    pub fn prefill(&self, ids: &[u32]) -> Result<Prefix, String> {
+        Ok(self
+            .run(ids, None, true)?
+            .1
+            .expect("prefill captures layer state"))
+    }
+
+    /// Hidden states of `ids` following `prefix`; bit-identical to the matching
+    /// rows of `forward` over the concatenated tokens.
+    pub fn forward_after(&self, prefix: &Prefix, ids: &[u32]) -> Result<Vec<f32>, String> {
+        Ok(self.run(ids, Some(prefix), false)?.0)
+    }
+
+    fn run(
+        &self,
+        ids: &[u32],
+        past: Option<&Prefix>,
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<Prefix>), String> {
         #[cfg(test)]
         self.forward_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if ids.is_empty() || ids.len() > 4096 {
+        let start = past.map_or(0, |p| p.len);
+        if ids.is_empty() || start + ids.len() > 4096 {
             return Err("token sequence must contain 1–4096 tokens".into());
         }
         let c = &self.config;
@@ -420,21 +445,40 @@ impl Model {
         }
         // Position-dependent values are shared by all heads and full-attention
         // layers in this forward pass; no request state is cached on the model.
-        let angles: Vec<_> = (0..ids.len())
+        let angles: Vec<_> = (start..start + ids.len())
             .flat_map(|pos| {
                 self.rotary_divisors
                     .iter()
                     .map(move |divisor| (pos as f32 / divisor).sin_cos())
             })
             .collect();
+        let mut captured = Vec::new();
         let mut n = vec![0.0; x.len()];
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             n.copy_from_slice(&x);
             rms(&mut n, &layer.input_norm, c.rms_norm_eps, true);
-            let mixed = match &layer.mixer {
-                Mixer::Full(m) => m.forward(&n, c, &angles),
-                Mixer::Delta(m) => m.forward(&n, c),
+            let (mixed, cache) = match (&layer.mixer, past.map(|p| &p.layers[i])) {
+                (Mixer::Full(m), None) => {
+                    let (out, k, v) = m.forward(&n, c, &angles, None);
+                    (out, LayerCache::Full { k, v })
+                }
+                (Mixer::Full(m), Some(LayerCache::Full { k, v })) => {
+                    let (out, k, v) = m.forward(&n, c, &angles, Some((k, v)));
+                    (out, LayerCache::Full { k, v })
+                }
+                (Mixer::Delta(m), None) => {
+                    let (out, tail, state) = m.forward(&n, c, start, None);
+                    (out, LayerCache::Delta { tail, state })
+                }
+                (Mixer::Delta(m), Some(LayerCache::Delta { tail, state })) => {
+                    let (out, tail, state) = m.forward(&n, c, start, Some((tail, state)));
+                    (out, LayerCache::Delta { tail, state })
+                }
+                _ => return Err("prefix cache does not match the layer types".into()),
             };
+            if capture {
+                captured.push(cache);
+            }
             residual_norm(&mut x, &mixed, &mut n, &layer.post_norm, c.rms_norm_eps);
             let mut gate = layer.gate.apply(&n);
             layer.up.apply_into(&n, &mut gate, Epilogue::SwiGlu);
@@ -444,12 +488,44 @@ impl Model {
         if x.iter().any(|v| !v.is_finite()) {
             return Err("non-finite Qwen hidden states".into());
         }
-        Ok(x)
+        let prefix = capture.then(|| Prefix {
+            len: start + ids.len(),
+            layers: captured,
+        });
+        Ok((x, prefix))
     }
 }
 
+/// What tokens after a prefix need from it: the prefix length and, per layer,
+/// full-attention keys and values or DeltaNet convolution inputs and state.
+pub(crate) struct Prefix {
+    len: usize,
+    layers: Vec<LayerCache>,
+}
+
+impl Prefix {
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+enum LayerCache {
+    /// Normalized, rotated keys and values of every prefix token.
+    Full { k: Vec<f32>, v: Vec<f32> },
+    /// The last `kernel - 1` convolution inputs and each head's recurrent state.
+    Delta { tail: Vec<f32>, state: Vec<f32> },
+}
+
 impl Full {
-    fn forward(&self, x: &[f32], c: &Config, angles: &[(f32, f32)]) -> Vec<f32> {
+    /// Returns the layer output and these tokens' normalized, rotated keys and values.
+    fn forward(
+        &self,
+        x: &[f32],
+        c: &Config,
+        angles: &[(f32, f32)],
+        past: Option<(&[f32], &[f32])>,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let n = x.len() / c.hidden_size;
         let d = c.head_dim;
         let qw = c.num_attention_heads * d;
@@ -479,14 +555,29 @@ impl Full {
                 rotary(&mut k[t * kw + h * d..t * kw + (h + 1) * d], angles);
             }
         }
-        let mut out = causal_attention(&q, &k, &v, c.num_attention_heads, c.num_key_value_heads, d);
+        let joined = past.map(|(pk, pv)| ([pk, &k].concat(), [pv, &v].concat()));
+        let (keys, values) = joined
+            .as_ref()
+            .map_or((&k[..], &v[..]), |(pk, pv)| (&pk[..], &pv[..]));
+        let offset = past.map_or(0, |(pk, _)| pk.len() / kw);
+        let mut out = causal_attention(
+            &q,
+            keys,
+            values,
+            c.num_attention_heads,
+            c.num_key_value_heads,
+            d,
+            offset,
+        );
         for (o, g) in out.iter_mut().zip(gate) {
             *o *= sigmoid(g);
         }
-        self.o.apply(&out)
+        (self.o.apply(&out), k, v)
     }
 }
 
+/// Causal attention for `n` query tokens at positions `offset..offset + n`, over
+/// keys and values for positions `0..offset + n`.
 fn causal_attention(
     q: &[f32],
     k: &[f32],
@@ -494,12 +585,13 @@ fn causal_attention(
     heads: usize,
     key_heads: usize,
     d: usize,
+    offset: usize,
 ) -> Vec<f32> {
     let qw = heads * d;
     let kw = key_heads * d;
     let n = q.len() / qw;
     assert_eq!(q.len(), n * qw);
-    assert_eq!(k.len(), n * kw);
+    assert_eq!(k.len(), (offset + n) * kw);
     assert_eq!(v.len(), k.len());
     let mut out = vec![0.0; n * qw];
     let scale = (d as f32).sqrt().recip();
@@ -512,7 +604,7 @@ fn causal_attention(
             let query = &q[t * qw + h * d..t * qw + (h + 1) * d];
             scores.clear();
             scores
-                .extend((0..=t).map(|s| {
+                .extend((0..=offset + t).map(|s| {
                     dot_scores(query, &k[s * kw + kh * d..s * kw + (kh + 1) * d]) * scale
                 }));
             softmax(scores);
@@ -529,11 +621,11 @@ fn causal_attention(
     };
     if n >= 32 && qw >= 128 && rayon::current_num_threads() > 1 {
         out.par_chunks_mut(qw).enumerate().for_each_init(
-            || Vec::with_capacity(n),
+            || Vec::with_capacity(offset + n),
             |scores, (t, row)| compute(t, row, scores),
         );
     } else {
-        let mut scores = Vec::with_capacity(n);
+        let mut scores = Vec::with_capacity(offset + n);
         for (t, row) in out.chunks_exact_mut(qw).enumerate() {
             compute(t, row, &mut scores);
         }
@@ -542,7 +634,16 @@ fn causal_attention(
 }
 
 impl Delta {
-    fn forward(&self, x: &[f32], c: &Config) -> Vec<f32> {
+    /// Continue from `past` (convolution inputs of the preceding tokens, at most
+    /// `kernel - 1` rows, and the recurrent state), with these tokens starting at
+    /// position `start`. Returns the layer output and the state after them.
+    fn forward(
+        &self,
+        x: &[f32],
+        c: &Config,
+        start: usize,
+        past: Option<(&[f32], &[f32])>,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let n = x.len() / c.hidden_size;
         let dk = c.linear_key_head_dim;
         let dv = c.linear_value_head_dim;
@@ -555,18 +656,32 @@ impl Delta {
         let b = self.b.apply(x);
         let mut conv = vec![0.0; raw.len()];
         let kernel = c.linear_conv_kernel_dim;
+        let tail = past.map_or(&[][..], |(tail, _)| tail);
+        let tail_rows = tail.len() / width;
+        assert_eq!(tail_rows, start.min(kernel - 1));
         for t in 0..n {
+            let position = start + t;
             for channel in 0..width {
                 let mut sum = 0.0;
                 for j in 0..kernel {
-                    if t + j + 1 >= kernel {
-                        sum += raw[(t + j + 1 - kernel) * width + channel]
-                            * self.conv[channel * kernel + j];
+                    if position + j + 1 >= kernel {
+                        // Inputs before `start` come from the preceding tokens' tail.
+                        let source = position + j + 1 - kernel;
+                        let value = if source >= start {
+                            raw[(source - start) * width + channel]
+                        } else {
+                            tail[(source + tail_rows - start) * width + channel]
+                        };
+                        sum += value * self.conv[channel * kernel + j];
                     }
                 }
                 conv[t * width + channel] = silu(sum);
             }
         }
+        let mut state = past.map_or_else(
+            || vec![0.0; c.linear_num_value_heads * dk * dv],
+            |(_, state)| state.to_vec(),
+        );
         let out = Recurrence {
             key_heads: c.linear_num_key_heads,
             value_heads: c.linear_num_value_heads,
@@ -577,8 +692,14 @@ impl Delta {
             dt: &self.dt,
             norm: &self.norm,
         }
-        .run(&conv, &a, &b, &z);
-        self.out.apply(&out)
+        .run(&conv, &a, &b, &z, &mut state);
+        // The last `kernel - 1` convolution inputs across the tail and these tokens.
+        let keep = (start + n).min(kernel - 1);
+        let mut next_tail = Vec::with_capacity(keep * width);
+        let from_tail = keep.saturating_sub(n);
+        next_tail.extend_from_slice(&tail[(tail_rows - from_tail) * width..]);
+        next_tail.extend_from_slice(&raw[(n - (keep - from_tail)) * width..]);
+        (self.out.apply(&out), next_tail, state)
     }
 }
 
@@ -597,21 +718,34 @@ struct Recurrence<'a> {
 impl Recurrence<'_> {
     /// Normalized, gated output `[n, value_heads * dv]` from the convolved q/k/v
     /// channels and the `a`, `b` and `z` projections of `n` tokens.
-    fn run(&self, conv: &[f32], a: &[f32], b: &[f32], z: &[f32]) -> Vec<f32> {
+    /// `state` holds each head's `dk x dv` recurrent state; it is read as the
+    /// state before these tokens and left as the state after them.
+    fn run(&self, conv: &[f32], a: &[f32], b: &[f32], z: &[f32], state: &mut [f32]) -> Vec<f32> {
         let (dk, dv, heads) = (self.dk, self.dv, self.value_heads);
         let vd = heads * dv;
         let n = conv.len() / (2 * self.key_heads * dk + vd);
+        assert_eq!(state.len(), heads * dk * dv);
         if n == 0 {
             return Vec::new();
         }
         let mut by_head = vec![0.0; heads * n * dv];
-        let run = |(head, dst): (usize, &mut [f32])| self.head(head, conv, a, b, z, dst);
+        let run = |(head, (dst, state)): (usize, (&mut [f32], &mut [f32]))| {
+            self.head(head, conv, a, b, z, dst, state)
+        };
         // Heads own disjoint state and output rows, so running them in parallel
         // changes no arithmetic. Short sequences stay on the calling thread.
         if heads > 1 && n * dk * dv >= 1 << 16 && rayon::current_num_threads() > 1 {
-            by_head.par_chunks_mut(n * dv).enumerate().for_each(run);
+            by_head
+                .par_chunks_mut(n * dv)
+                .zip(state.par_chunks_mut(dk * dv))
+                .enumerate()
+                .for_each(run);
         } else {
-            by_head.chunks_mut(n * dv).enumerate().for_each(run);
+            by_head
+                .chunks_mut(n * dv)
+                .zip(state.chunks_mut(dk * dv))
+                .enumerate()
+                .for_each(run);
         }
         let mut out = vec![0.0; n * vd];
         for (head, rows) in by_head.chunks_exact(n * dv).enumerate() {
@@ -623,13 +757,22 @@ impl Recurrence<'_> {
     }
 
     /// One value head over every token, writing `[n, dv]` rows to `dst`.
-    fn head(&self, head: usize, conv: &[f32], a: &[f32], b: &[f32], z: &[f32], dst: &mut [f32]) {
+    #[allow(clippy::too_many_arguments)]
+    fn head(
+        &self,
+        head: usize,
+        conv: &[f32],
+        a: &[f32],
+        b: &[f32],
+        z: &[f32],
+        dst: &mut [f32],
+        state: &mut [f32],
+    ) {
         let (dk, dv, heads) = (self.dk, self.dv, self.value_heads);
         let kd = self.key_heads * dk;
         let vd = heads * dv;
         let width = 2 * kd + vd;
         let kh = head / (heads / self.key_heads);
-        let mut state = vec![0.0; dk * dv];
         let mut q = vec![0.0; dk];
         let mut k = vec![0.0; dk];
         let mut delta = vec![0.0; dv];
@@ -768,12 +911,20 @@ mod tests {
                 .collect();
             for pool in &pools {
                 pool.install(|| {
-                    black_box(causal_attention(&q, &k, &v, heads, key_heads, d));
+                    black_box(causal_attention(&q, &k, &v, heads, key_heads, d, 0));
                 });
                 let start = Instant::now();
                 for _ in 0..3 {
                     pool.install(|| {
-                        black_box(causal_attention(black_box(&q), &k, &v, heads, key_heads, d));
+                        black_box(causal_attention(
+                            black_box(&q),
+                            &k,
+                            &v,
+                            heads,
+                            key_heads,
+                            d,
+                            0,
+                        ));
                     });
                 }
                 println!(
@@ -892,11 +1043,13 @@ mod tests {
                 .map(|i| (i % 5) as f32 / 5.0)
                 .collect();
             for pool in &pools {
-                pool.install(|| black_box(recurrence.run(&conv, &gates, &gates, &z)));
+                let mut state = vec![0.0; value_heads * dk * dv];
+                pool.install(|| black_box(recurrence.run(&conv, &gates, &gates, &z, &mut state)));
                 let start = Instant::now();
                 for _ in 0..3 {
+                    state.fill(0.0);
                     pool.install(|| {
-                        black_box(recurrence.run(black_box(&conv), &gates, &gates, &z))
+                        black_box(recurrence.run(black_box(&conv), &gates, &gates, &z, &mut state))
                     });
                 }
                 println!(
@@ -952,7 +1105,10 @@ mod tests {
             };
             let expected = reference_recurrence(&recurrence, &conv, &a, &b, &z);
             for pool in &pools {
-                let actual = pool.install(|| recurrence.run(&conv, &a, &b, &z));
+                let actual = pool.install(|| {
+                    let mut state = vec![0.0; value_heads * dk * dv];
+                    recurrence.run(&conv, &a, &b, &z, &mut state)
+                });
                 assert_eq!(
                     actual, expected,
                     "{key_heads}/{value_heads} heads, {dk}x{dv}, {n} tokens"
@@ -983,12 +1139,12 @@ mod tests {
             let mut v: Vec<f32> = (0..k.len())
                 .map(|i| ((i * 13 % 89) as f32 - 44.0) / 33.0)
                 .collect();
-            let expected = serial.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
-            let actual = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
+            let expected = serial.install(|| causal_attention(&q, &k, &v, heads, key_heads, d, 0));
+            let actual = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d, 0));
             assert_eq!(actual, expected);
             k[(n - 3) * key_heads * d..].fill(7.0);
             v[(n - 3) * key_heads * d..].fill(-11.0);
-            let changed = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d));
+            let changed = parallel.install(|| causal_attention(&q, &k, &v, heads, key_heads, d, 0));
             assert_eq!(
                 &actual[..(n - 3) * heads * d],
                 &changed[..(n - 3) * heads * d]

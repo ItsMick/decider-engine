@@ -140,6 +140,12 @@ pub struct NativeEngine {
     revisions: Option<Revisions>,
 }
 
+/// The state prefix shared by a request's questions, run once.
+struct SharedPrefix {
+    ids: Vec<u32>,
+    cache: qwen::Prefix,
+}
+
 /// Recorded by `scripts/download-model.py` as `revisions.json`.
 #[derive(Deserialize)]
 struct Revisions {
@@ -325,12 +331,7 @@ impl NativeEngine {
         schema::content(state, false)?;
         question.validate()?;
         let rendered = prompt::render(question);
-        Ok(encode(
-            &self.tokenizer,
-            state,
-            &rendered,
-            self.config.max_length,
-        )?)
+        Ok(encode(&self.tokenizer, state, &rendered, self.config.max_length)?.0)
     }
     /// Run an already bound prompt through the native torso and pointer head.
     pub fn raw_logits(&self, encoded: &Encoding) -> Result<Vec<f32>, String> {
@@ -345,6 +346,28 @@ impl NativeEngine {
         {
             return Err("invalid encoding positions or window".into());
         }
+        self.logits(encoded, None)
+    }
+
+    /// Pointer logits, continuing from `shared` when the encoding starts with its
+    /// tokens and every option lies after them; otherwise a full forward pass.
+    fn logits(
+        &self,
+        encoded: &Encoding,
+        shared: Option<&SharedPrefix>,
+    ) -> Result<Vec<f32>, String> {
+        if let Some(shared) = shared.filter(|p| {
+            encoded.input_ids.len() > p.ids.len()
+                && encoded.input_ids.starts_with(&p.ids)
+                && encoded.option_positions.iter().all(|i| *i >= p.ids.len())
+        }) {
+            let start = shared.ids.len();
+            let hidden = self
+                .model
+                .forward_after(&shared.cache, &encoded.input_ids[start..])?;
+            let positions: Vec<_> = encoded.option_positions.iter().map(|i| i - start).collect();
+            return Ok(self.head.logits(&hidden, &positions));
+        }
         let hidden = self.model.forward(&encoded.input_ids)?;
         Ok(self.head.logits(&hidden, &encoded.option_positions))
     }
@@ -355,7 +378,7 @@ fn encode(
     state: &Value,
     rendered: &prompt::Rendered,
     max_length: usize,
-) -> Result<Encoding, DecideError> {
+) -> Result<(Encoding, usize), DecideError> {
     let engine = |e: tokenizers::Error| DecideError::new(ErrorKind::Engine, e.to_string());
     // Strands tokenizes the prefix and question independently, then concatenates.
     let s = tokenizer
@@ -386,11 +409,12 @@ fn encode(
         positions.push(s.len() + index);
     }
     let ids = s.get_ids().iter().chain(q.get_ids()).copied().collect();
-    Ok(Encoding {
+    let encoding = Encoding {
         input_ids: ids,
         option_positions: positions,
         answer_position: total - 1,
-    })
+    };
+    Ok((encoding, s.len()))
 }
 impl DecisionEngine for NativeEngine {
     fn model(&self) -> &str {
@@ -427,7 +451,7 @@ impl NativeEngine {
             .iter()
             .map(|(name, q)| {
                 let rendered = prompt::render(q);
-                let enc = encode(
+                let (enc, state_tokens) = encode(
                     &self.tokenizer,
                     &request.state,
                     &rendered,
@@ -436,13 +460,26 @@ impl NativeEngine {
                 total_tokens = limits
                     .add_tokens(total_tokens, enc.input_ids.len())
                     .map_err(fail(ErrorKind::ResourceLimit))?;
-                Ok((name, q, rendered, enc))
+                Ok((name, q, rendered, enc, state_tokens))
             })
             .collect::<Result<_, DecideError>>()?;
+        // Every question repeats the same separately tokenized state, so run it once
+        // and continue each question from its cached layer state. Results are
+        // bit-identical to separate forward passes.
+        let shared = match encoded.as_slice() {
+            [(_, _, _, first, state_tokens), _, ..] => {
+                let ids = first.input_ids[..*state_tokens].to_vec();
+                let cache = self.model.prefill(&ids).map_err(fail(ErrorKind::Engine))?;
+                Some(SharedPrefix { ids, cache })
+            }
+            _ => None,
+        };
         let mut input_tokens = 0;
         let mut answers = BTreeMap::new();
-        for (name, q, rendered, enc) in encoded {
-            let mut logits = self.raw_logits(&enc).map_err(fail(ErrorKind::Engine))?;
+        for (name, q, rendered, enc, _) in encoded {
+            let mut logits = self
+                .logits(&enc, shared.as_ref())
+                .map_err(fail(ErrorKind::Engine))?;
             let temperature = self
                 .config
                 .temperature_by_kind
@@ -673,6 +710,79 @@ mod tests {
         let a = e.model.forward(&[1, 2, 5, 3, 7, 11]).unwrap();
         let b = e.model.forward(&[1, 2, 5, 3, 9, 10]).unwrap();
         assert_eq!(&a[..4 * 8], &b[..4 * 8]);
+    }
+    #[test]
+    fn requests_share_one_state_prefill_and_match_separate_passes_exactly() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let request: Request = serde_json::from_str(include_str!("../tests/request.json")).unwrap();
+        for precision in [
+            Precision::Checkpoint,
+            Precision::Int8Compute,
+            Precision::Int4,
+        ] {
+            let e = NativeEngine::load_with_precision(&fixture(), precision).unwrap();
+            let shared_response = serde_json::to_value(e.decide(&request).unwrap()).unwrap();
+            // One prefill plus one continuation per question.
+            assert_eq!(
+                e.model.forward_calls.load(Relaxed),
+                1 + request.questions.len()
+            );
+            let mut separate = serde_json::Map::new();
+            for (name, q) in &request.questions {
+                let enc = e.encode(&request.state, q).unwrap();
+                let mut logits = e.raw_logits(&enc).unwrap();
+                let t = e.config.temperature_by_kind.get(q.kind()).copied().unwrap();
+                for v in &mut logits {
+                    *v /= t;
+                }
+                softmax(&mut logits);
+                let answer = prompt::render(q).answer(q, &logits, e.config.ordinal_smoothing);
+                separate.insert(name.clone(), serde_json::to_value(answer).unwrap());
+            }
+            assert_eq!(
+                shared_response["answers"],
+                Value::Object(separate),
+                "{precision:?}"
+            );
+        }
+    }
+    #[test]
+    fn prefix_cache_reproduces_full_forward_rows_exactly() {
+        let hidden = 8;
+        let ids: Vec<u32> = (0..140u32).map(|i| (i * 7 + i / 5) % 32).collect();
+        for precision in [
+            Precision::Checkpoint,
+            Precision::Int8,
+            Precision::Int8Compute,
+            Precision::Int4,
+        ] {
+            let e = NativeEngine::load_with_precision(&fixture(), precision).unwrap();
+            // Prefixes shorter than the convolution kernel, splits on both sides of
+            // the 64-row projection schedule, and a single-token suffix.
+            for (total, split) in [
+                (2, 1),
+                (7, 2),
+                (6, 5),
+                (40, 3),
+                (75, 70),
+                (75, 10),
+                (140, 64),
+            ] {
+                let full = e.model.forward(&ids[..total]).unwrap();
+                let prefix = e.model.prefill(&ids[..split]).unwrap();
+                assert_eq!(prefix.len(), split);
+                let rest = e.model.forward_after(&prefix, &ids[split..total]).unwrap();
+                assert_eq!(
+                    rest,
+                    full[split * hidden..],
+                    "{precision:?} {split}+{}",
+                    total - split
+                );
+                // A prefix serves any number of continuations unchanged.
+                let again = e.model.forward_after(&prefix, &ids[split..total]).unwrap();
+                assert_eq!(again, rest);
+            }
+        }
     }
     #[test]
     fn rejects_missing_weights_invalid_positions_and_overlong_prompts() {
