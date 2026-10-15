@@ -9,6 +9,8 @@ mod error;
 mod int8;
 mod limits;
 mod loading;
+#[cfg(feature = "profile")]
+mod profiling;
 mod prompt;
 mod qwen;
 pub mod schema;

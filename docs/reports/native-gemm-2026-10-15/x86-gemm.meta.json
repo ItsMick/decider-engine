@@ -1,0 +1,12 @@
+{
+  "command": [
+    "decider-engine/target/native/release/examples/compare_logits",
+    "decider-engine/models/v21",
+    "/tmp/gemm-cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 107.73789018499883,
+  "peak_rss_kib": 3943932
+}

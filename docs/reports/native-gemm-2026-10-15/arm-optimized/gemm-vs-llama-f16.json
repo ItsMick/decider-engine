@@ -1,0 +1,58 @@
+{
+  "threads": 4,
+  "cases": [
+    {
+      "id": "original-three/route",
+      "tokens": 87,
+      "warm_samples": 3,
+      "native_median_ms": 1603.1224229999998,
+      "llama_median_ms": 1217.957281,
+      "native_over_llama_ratio": 1.3162386300476494,
+      "max_abs_logit_difference": 0.008774816989898682,
+      "max_abs_calibrated_probability_difference": 0.0029841575103173312,
+      "argmax_matches": true,
+      "native_max_reference_error": 8.940696716308594e-07,
+      "llama_max_reference_error": 0.008775711059570312
+    },
+    {
+      "id": "original-three/urgent",
+      "tokens": 86,
+      "warm_samples": 3,
+      "native_median_ms": 1599.1870339999998,
+      "llama_median_ms": 1201.261286,
+      "native_over_llama_ratio": 1.331256615556992,
+      "max_abs_logit_difference": 0.0034869909286499023,
+      "max_abs_calibrated_probability_difference": 0.0003240299653856499,
+      "argmax_matches": true,
+      "native_max_reference_error": 1.9073486328125e-06,
+      "llama_max_reference_error": 0.0034867525100708008
+    },
+    {
+      "id": "original-three/severity",
+      "tokens": 88,
+      "warm_samples": 3,
+      "native_median_ms": 1595.246051,
+      "llama_median_ms": 1231.493613,
+      "native_over_llama_ratio": 1.2953750097930876,
+      "max_abs_logit_difference": 0.006043672561645508,
+      "max_abs_calibrated_probability_difference": 0.0014761853653062484,
+      "argmax_matches": true,
+      "native_max_reference_error": 2.8908252716064453e-06,
+      "llama_max_reference_error": 0.006046563386917114
+    },
+    {
+      "id": "window-1024/q",
+      "tokens": 1024,
+      "warm_samples": 3,
+      "native_median_ms": 18050.169287,
+      "llama_median_ms": 14298.416175,
+      "native_over_llama_ratio": 1.2623894189455567,
+      "max_abs_logit_difference": 0.001395106315612793,
+      "max_abs_calibrated_probability_difference": 0.00013375143556881852,
+      "argmax_matches": true,
+      "native_max_reference_error": 4.76837158203125e-07,
+      "llama_max_reference_error": 0.001395106315612793
+    }
+  ],
+  "note": "Per-question raw-logit execution including pointer head; no shared-prefix cache, tokenizer, HTTP, score confidence or response serialization. Different arithmetic: strict reference equivalence is not assumed."
+}

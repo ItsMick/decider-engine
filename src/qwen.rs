@@ -437,6 +437,11 @@ impl Model {
             return Err("token sequence must contain 1–4096 tokens".into());
         }
         let c = &self.config;
+        #[cfg(feature = "profile")]
+        let _profile = crate::profiling::Span::new(
+            "model",
+            [ids.len(), c.hidden_size, c.num_hidden_layers, start],
+        );
         let size = crate::loading::product("hidden activations", &[ids.len(), c.hidden_size])?;
         let mut x = Vec::with_capacity(size);
         let mut scratch = Vec::new();
@@ -599,6 +604,8 @@ fn causal_attention(
     let qw = heads * d;
     let kw = key_heads * d;
     let n = q.len() / qw;
+    #[cfg(feature = "profile")]
+    let _profile = crate::profiling::Span::new("attention", [n, offset + n, heads, d]);
     assert_eq!(q.len(), n * qw);
     assert_eq!(k.len(), (offset + n) * kw);
     assert_eq!(v.len(), k.len());
@@ -718,6 +725,8 @@ fn convolve(
     taps: &[f32],
 ) -> Vec<f32> {
     let n = raw.len() / width;
+    #[cfg(feature = "profile")]
+    let _profile = crate::profiling::Span::new("convolution", [n, width, kernel, 0]);
     let tail_rows = tail.len() / width;
     assert_eq!(taps.len(), kernel * width);
     let row = |t: usize, out: &mut [f32]| {
@@ -776,6 +785,8 @@ impl Recurrence<'_> {
         let (dk, dv, heads) = (self.dk, self.dv, self.value_heads);
         let vd = heads * dv;
         let n = conv.len() / (2 * self.key_heads * dk + vd);
+        #[cfg(feature = "profile")]
+        let _profile = crate::profiling::Span::new("recurrence", [n, heads, dk, dv]);
         assert_eq!(state.len(), heads * dk * dv);
         if n == 0 {
             return Vec::new();

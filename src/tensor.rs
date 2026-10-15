@@ -141,6 +141,16 @@ impl Projection<'_> {
     ) {
         let (input, output) = (self.input, self.output);
         let rows = x.len() / input;
+        #[cfg(feature = "profile")]
+        let _profile = crate::profiling::Span::new(
+            "projection",
+            [
+                rows,
+                input,
+                output,
+                self.adapter.as_ref().map_or(0, |a| a.rank),
+            ],
+        );
         assert_eq!(x.len(), rows * input);
         assert_eq!(self.weights.len(), output * input);
         assert_eq!(result.len(), rows * output);
@@ -197,6 +207,10 @@ impl Projection<'_> {
             if let Some(columns) = linear_int8(x, self, quantized) {
                 return columns;
             }
+        }
+        #[cfg(feature = "fast-gemm")]
+        if x.len() / self.input >= 64 && self.input >= 1024 && self.output >= 128 {
+            return self.columns_gemm(x);
         }
         self.columns_tiled::<TILE>(x)
     }
@@ -267,6 +281,55 @@ impl Projection<'_> {
         }
         columns
     }
+
+    /// A safe view onto a packed weight panel; the optional Rust GEMM backend
+    /// owns its packing and SIMD dispatch. Its reduction order can differ.
+    #[cfg(feature = "fast-gemm")]
+    fn columns_gemm(&self, x: &[f32]) -> Vec<f32> {
+        use ndarray::{linalg::general_mat_mul, ArrayView2, ArrayViewMut2, ShapeBuilder};
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
+        #[cfg(feature = "profile")]
+        let _profile = crate::profiling::Span::new("projection.gemm", [rows, input, output, 0]);
+        let a = ArrayView2::from_shape((rows, input), x).expect("validated input shape");
+        let mut columns = vec![0.0; rows * output];
+        columns
+            .par_chunks_mut(rows * 128)
+            .enumerate()
+            .for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(weights_scratch, adapter_scratch), (block, dst)| {
+                    let first = block * 128;
+                    let count = dst.len() / rows;
+                    let packed = self
+                        .weights
+                        .row(first * input, count * input, weights_scratch);
+                    let b = ArrayView2::from_shape((count, input), packed)
+                        .expect("validated weight panel");
+                    let mut c = ArrayViewMut2::from_shape((rows, count).f(), &mut *dst)
+                        .expect("disjoint column panel");
+                    general_mat_mul(1.0, &a, &b.t(), 0.0, &mut c);
+                    for (j, column) in dst.chunks_exact_mut(rows).enumerate() {
+                        let bias = self.bias.map_or(0.0, |bias| bias[first + j]);
+                        let adapter = self.adapter.as_ref().map(|adapter| {
+                            (
+                                adapter,
+                                adapter.weights.row(
+                                    (first + j) * adapter.rank,
+                                    adapter.rank,
+                                    adapter_scratch,
+                                ),
+                            )
+                        });
+                        for (row, value) in column.iter_mut().enumerate() {
+                            let base = *value + bias;
+                            *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+                        }
+                    }
+                },
+            );
+        columns
+    }
 }
 
 fn write_columns(
@@ -277,6 +340,48 @@ fn write_columns(
     result: &mut [f32],
     epilogue: Epilogue,
 ) {
+    #[cfg(feature = "profile")]
+    let _profile = crate::profiling::Span::new(
+        "projection.write",
+        [rows, output, usize::from(adapter.is_some()), 0],
+    );
+    if result.len() >= 1 << 16 {
+        const BLOCK: usize = 16;
+        let write = |block: usize, dst: &mut [f32]| {
+            let first_row = block * BLOCK;
+            let count = dst.len() / output;
+            let mut tile = [0.0f32; BLOCK * BLOCK];
+            for first_col in (0..output).step_by(BLOCK) {
+                let width = BLOCK.min(output - first_col);
+                // Read contiguous source columns into a small row-major tile,
+                // then write whole destination cache lines. Arithmetic is unchanged.
+                for col in 0..width {
+                    let start = (first_col + col) * rows + first_row;
+                    for (row, base) in columns[start..start + count].iter().enumerate() {
+                        tile[row * BLOCK + col] = adapter
+                            .map_or(*base, |(delta, scale)| *base + scale * delta[start + row]);
+                    }
+                }
+                for (row, values) in dst.chunks_exact_mut(output).enumerate() {
+                    for (col, value) in values[first_col..first_col + width].iter_mut().enumerate()
+                    {
+                        epilogue.store(value, tile[row * BLOCK + col]);
+                    }
+                }
+            }
+        };
+        if rayon::current_num_threads() > 1 {
+            result
+                .par_chunks_mut(BLOCK * output)
+                .enumerate()
+                .for_each(|(block, dst)| write(block, dst));
+        } else {
+            for (block, dst) in result.chunks_mut(BLOCK * output).enumerate() {
+                write(block, dst);
+            }
+        }
+        return;
+    }
     for (row, dst) in result.chunks_exact_mut(output).enumerate() {
         for (column, value) in dst.iter_mut().enumerate() {
             let index = column * rows + row;
@@ -862,6 +967,12 @@ mod tests {
             (7, 64, 5),
             (19, 131, 31),
             (67, 40, 7),
+            (23, 257, 23),
+            (24, 256, 24),
+            (25, 257, 25),
+            (63, 257, 47),
+            (64, 256, 48),
+            (65, 257, 49),
         ] {
             let x: Vec<f32> = (0..rows * input)
                 .map(|i| ((i * 43 % 113) as f32 - 56.0) / 32.0)
@@ -934,6 +1045,72 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fast-gemm")]
+    #[test]
+    fn gemm_columns_match_reference_across_panels_and_layouts() {
+        let rank = 5;
+        for (rows, input, output) in [
+            (1, 9, 1),
+            (2, 33, 3),
+            (25, 257, 25),
+            (63, 1024, 129),
+            (64, 1024, 128),
+            (65, 1025, 131),
+        ] {
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| (i % 31) as f32 / 16.0 - 0.9)
+                .collect();
+            let bias: Vec<f32> = (0..output).map(|i| (i % 7) as f32 / 13.0).collect();
+            let mid: Vec<f32> = (0..rows * rank)
+                .map(|i| (i % 11) as f32 / 19.0 - 0.2)
+                .collect();
+            let adapter_weights = Data::F32(
+                (0..output * rank)
+                    .map(|i| (i % 9) as f32 / 23.0 - 0.1)
+                    .collect(),
+            );
+            let values: Vec<f32> = (0..output * input)
+                .map(|i| ((i * 17 % 89) as f32 - 44.0) / (32.0 * (input as f32).sqrt()))
+                .collect();
+            let bf16 = || Data::Bf16(values.iter().map(|v| (v.to_bits() >> 16) as u16).collect());
+            for weights in [
+                Data::F32(values.clone()),
+                bf16(),
+                bf16().quantize(input, Precision::Int8),
+                bf16().quantize(input, Precision::Int4),
+            ] {
+                for (with_bias, with_adapter) in [(false, false), (true, false), (true, true)] {
+                    let p = Projection {
+                        input,
+                        output,
+                        weights: &weights,
+                        bias: with_bias.then_some(&bias[..]),
+                        adapter: with_adapter.then_some(Adapter {
+                            inputs: &mid,
+                            weights: &adapter_weights,
+                            rank,
+                            scale: 0.375,
+                        }),
+                    };
+                    let expected = p.columns_tiled::<1>(&x);
+                    for workers in [1, 4] {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(workers)
+                            .build()
+                            .unwrap();
+                        let actual = pool.install(|| p.columns_gemm(&x));
+                        for (got, want) in actual.iter().zip(&expected) {
+                            assert!(
+                                (got - want).abs() <= 1e-5 + 5e-6 * want.abs(),
+                                "{rows}x{input}->{output}: {got} != {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn parallel_projection_handles_bias_and_non_aligned_dimensions() {
         let (rows, input, output) = (19, 13, 31);
@@ -957,6 +1134,71 @@ mod tests {
                         .map(|k| x[row * input + k] * w[col * input + k])
                         .sum::<f32>();
                 assert_eq!(y[row * output + col], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_output_matches_scalar_writes_bit_for_bit() {
+        for (rows, output) in [
+            (0, 1),
+            (1, 1),
+            (15, 17),
+            (16, 16),
+            (17, 31),
+            (33, 33),
+            (65, 2048),
+            (257, 513),
+        ] {
+            let columns: Vec<f32> = (0..rows * output)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        -0.0
+                    } else {
+                        (i % 31) as f32 / 16.0 - 0.9
+                    }
+                })
+                .collect();
+            let delta: Vec<f32> = (0..rows * output)
+                .map(|i| (i % 7) as f32 / 19.0 - 0.1)
+                .collect();
+            let initial: Vec<f32> = (0..rows * output)
+                .map(|i| (i % 11) as f32 / 13.0 - 0.2)
+                .collect();
+            for adapter in [None, Some((&delta[..], 0.375))] {
+                for epilogue in [Epilogue::Write, Epilogue::Add, Epilogue::SwiGlu] {
+                    let mut expected = initial.clone();
+                    for row in 0..rows {
+                        for col in 0..output {
+                            let idx = col * rows + row;
+                            let value =
+                                adapter.map_or(columns[idx], |(d, s)| columns[idx] + s * d[idx]);
+                            let dst = &mut expected[row * output + col];
+                            *dst = match epilogue {
+                                Epilogue::Write => value,
+                                Epilogue::Add => *dst + value,
+                                Epilogue::SwiGlu => crate::qwen::silu(*dst) * value,
+                            };
+                        }
+                    }
+                    for workers in [1, 4] {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(workers)
+                            .build()
+                            .unwrap();
+                        let mut actual = initial.clone();
+                        pool.install(|| {
+                            write_columns(&columns, adapter, rows, output, &mut actual, epilogue)
+                        });
+                        assert!(
+                            actual
+                                .iter()
+                                .zip(&expected)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{rows}x{output}, {workers} workers"
+                        );
+                    }
+                }
             }
         }
     }

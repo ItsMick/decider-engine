@@ -1,0 +1,9 @@
+{
+  "run_id": 38659917884,
+  "job_id": 116178966367,
+  "artifact_id": 11938239809,
+  "source_commit": "cfa5abf6d140b5f19c2490cba13fd326a91e1640",
+  "baseline_commit": "2e684576c5f0c44598e65f32d68f66970c419386",
+  "artifact_sha256": "e7a86af240968a8fec3f212bf91b86517a9b3fa5ec505e30c17a8afd619f50bd",
+  "note": "Text logs have ANSI color codes and surplus trailing blank lines removed. Timing JSONL values are unchanged."
+}

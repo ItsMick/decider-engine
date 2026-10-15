@@ -1,0 +1,42 @@
+{
+  "before": {
+    "warmup": {
+      "projection.write": 6855.932212999994,
+      "projection": 19908.084297999994,
+      "projection.gemm": 11676.811755000002,
+      "convolution": 477.950581,
+      "recurrence": 939.166711,
+      "attention": 438.97426400000006,
+      "model": 22265.679990999997
+    },
+    "measured": {
+      "projection.write": 7019.081699999998,
+      "projection": 20310.49828799999,
+      "projection.gemm": 11839.594877999996,
+      "convolution": 492.95448400000004,
+      "recurrence": 967.7122110000001,
+      "attention": 426.371037,
+      "model": 22692.239234999997
+    }
+  },
+  "after": {
+    "warmup": {
+      "projection.write": 1841.9804119999997,
+      "projection": 17198.61675300001,
+      "projection.gemm": 13686.992267999998,
+      "convolution": 531.580183,
+      "recurrence": 1049.413947,
+      "attention": 458.35608399999995,
+      "model": 19858.126745
+    },
+    "measured": {
+      "projection.write": 1629.653931000001,
+      "projection": 14999.292628000014,
+      "projection.gemm": 11941.059547,
+      "convolution": 519.6537850000001,
+      "recurrence": 943.8213470000001,
+      "attention": 434.993707,
+      "model": 17446.356914
+    }
+  }
+}

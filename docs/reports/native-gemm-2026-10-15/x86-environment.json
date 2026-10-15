@@ -1,0 +1,36 @@
+{
+  "baseline_commit": "2e684576c5f0c44598e65f32d68f66970c419386",
+  "gemm_commit": "6277850e57a9503782db01e83bb77e34bfaec1d5",
+  "native_features": "fast-gemm",
+  "rustflags": "-C target-cpu=native",
+  "threads": 4,
+  "warmup_per_case": 1,
+  "measured_samples_per_case": 3,
+  "measurement_order": [
+    "baseline",
+    "gemm"
+  ],
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  9\nOn-line CPU(s) list:                     0-8\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC 9V74 80-Core Processor\nBIOS Model name:                           CPU @ 0.0GHz\nBIOS CPU family:                         0\nCPU family:                              25\nModel:                                   17\nThread(s) per core:                      1\nCore(s) per socket:                      9\nSocket(s):                               1\nStepping:                                1\nBogoMIPS:                                5192.30\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx512_bf16 clzero xsaveerptr arat npt nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               160 KiB (5 instances)\nL1i cache:                               160 KiB (5 instances)\nL2 cache:                                5 MiB (5 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-8\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Vulnerable\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Vulnerable\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected\n",
+  "cgroup_cpu_max": "800000 100000",
+  "cgroup_memory_max": "8589934592",
+  "binary_sha256": {
+    "baseline": "d4fbf55111aa66563e790f72450670f807bcfabe0354946eff9af263ee0bbd5c",
+    "gemm": "af9d21c922841a5d27aabb4bd39ab7d2f60736b3471b10f4385d58d9cf06034f",
+    "gemm_tiled": "646301bb4798700e3b74d3ef9767f5358bf0be768ff6598a6506bf5f30b901c5",
+    "gemm_retained": "af604bc9ef0cb63f3efdd995ca77f473f793e6e12c20fe9b5143ca479cd209a0"
+  },
+  "model_revisions": {
+    "decider": "2b52a6235c1b8306bbfa30b00b9d4b74b63a39f5",
+    "base": "b1485b2fa6dfa1287294f269f5fb618e03d52d7c"
+  },
+  "gemm_tiled_commit": "cfa5abf6d140b5f19c2490cba13fd326a91e1640",
+  "retained_source_parent": "cfa5abf6d140b5f19c2490cba13fd326a91e1640",
+  "retained_core_sha256": {
+    "src/lib.rs": "8af3d6f241b250cfca4877a9dbb3c716d44efef9ecab6275a55618a6ad9c60a2",
+    "src/qwen.rs": "7f5248e409eef7207ade9361544be436cb4303985c4db05b57ae48814c953f41",
+    "src/tensor.rs": "cb08c71a1f441ad3df38f0a402774752904c2aa8054017f99aa9bf5bf44f5088",
+    "src/profiling.rs": "8c876d77a7b204e161eb795765469f7c73ff867e9d9130cd9a7fa57ee32e2040",
+    "Cargo.toml": "f5b1e4286f83e30353f8e9d0cfcd1f0870de759b08bad38dde6d25a182d8d8b6",
+    "Cargo.lock": "6e315a2894c8c16c6f7ea9ecc1cd2b27c124f6f1a1468d38eb3a74f70d879c82"
+  }
+}

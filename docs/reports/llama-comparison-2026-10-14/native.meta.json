@@ -1,0 +1,12 @@
+{
+  "command": [
+    "decider-engine/target/release/examples/compare_logits",
+    "decider-engine/models/v21",
+    "/tmp/comparison/cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "peak_rss_kib": 3947904,
+  "wall_s": 282.2068636060003
+}

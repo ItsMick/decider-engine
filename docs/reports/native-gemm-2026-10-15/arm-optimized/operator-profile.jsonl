@@ -1,0 +1,3 @@
+{"load_ms":4955.127502,"threads":4}
+{"id":"window-1024/q","sample":0,"warmup":true,"tokens":1024,"elapsed_ms":18050.783829,"logits":[-1.1079570055007935,1.4029942750930786]}
+{"id":"window-1024/q","sample":1,"warmup":false,"tokens":1024,"elapsed_ms":18069.157446999998,"logits":[-1.1079570055007935,1.4029942750930786]}
