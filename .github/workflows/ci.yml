@@ -33,6 +33,11 @@ jobs:
       - run: cargo test --locked
         env:
           DECIDER_REQUIRE_DOTPROD: ${{ (matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest') && '1' || '0' }}
+      - name: Check experimental compute and profiling features
+        if: matrix.os == 'ubuntu-24.04-arm' || (matrix.os == 'ubuntu-latest' && matrix.rust == '1.98')
+        run: |
+          cargo clippy --locked --all-features --all-targets -- -D warnings
+          cargo test --locked --all-features
       - name: Pinned v21 prompt binding (tokenizer only, no weights)
         shell: bash
         run: |

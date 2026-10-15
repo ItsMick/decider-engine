@@ -13,6 +13,7 @@ exclude = [".github/**", "models/**", "*.part", "lambda/**"]
 # Experimental until matched ARM end-to-end measurements establish the gain.
 cache-blocking = []
 fast-gemm = ["dep:ndarray"]
+profile = []
 
 [dependencies]
 rayon = "1.11"

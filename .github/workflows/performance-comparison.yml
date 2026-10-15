@@ -10,7 +10,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: performance-${{ github.event.pull_request.head.sha || github.sha }}
+  group: performance-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   compare:
@@ -60,7 +60,7 @@ jobs:
           cmake --build /tmp/llama.cpp/build --target llama -j 4
           g++ -O3 -std=c++17 -I /tmp/llama.cpp/include -I /tmp/llama.cpp/ggml/include -I /tmp/llama.cpp/vendor scripts/llama-compare.cpp -L /tmp/llama.cpp/build/bin -Wl,-rpath,/tmp/llama.cpp/build/bin -lllama -lggml -lggml-base -o /tmp/llama-compare
           cp models/v21/tokenizer*.json models/v21/base/
-          python3 /tmp/llama.cpp/convert_hf_to_gguf.py models/v21/base --outtype bf16 --outfile /tmp/base-bf16.gguf > validation/base-conversion.log 2>&1
+          python3 /tmp/llama.cpp/convert_hf_to_gguf.py models/v21/base --outtype f16 --outfile /tmp/base-f16.gguf > validation/f16-conversion.log 2>&1
           python3 /tmp/llama.cpp/convert_lora_to_gguf.py --base models/v21/base --outtype f32 --outfile /tmp/lora-f32.gguf models/v21/lora > validation/lora-conversion.log 2>&1
           python3 scripts/prepare-llama-comparison.py models/v21 /tmp/prepared
       - name: Record environment before serial measurements
@@ -82,8 +82,9 @@ jobs:
               fi
             done
             free -h
+            df -h
             python3 -m pip freeze
-            sha256sum /tmp/base-bf16.gguf /tmp/lora-f32.gguf /tmp/prepared/cases.json scripts/llama-compare.cpp
+            sha256sum /tmp/base-f16.gguf /tmp/lora-f32.gguf /tmp/prepared/cases.json scripts/llama-compare.cpp
             grep -E 'GGML_NATIVE:|GGML_CPU_ARM_ARCH:' /tmp/llama.cpp/build/CMakeCache.txt
           } > validation/environment.txt
       - name: Required full-checkpoint GEMM numerical parity
@@ -93,7 +94,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --release --locked --features fast-gemm --test model -- --ignored --nocapture 2>&1 | tee validation/gemm-parity.log
-      - name: Serial full-model native baseline, GEMM candidate, llama BF16
+      - name: Serial full-model native baseline, GEMM candidate, llama F16
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -104,21 +105,43 @@ jobs:
           common = ['models/v21', '/tmp/prepared/cases.json', '3', '4']
           runner.measure(['/tmp/decider-baseline', *common], Path('validation/baseline'))
           runner.measure(['/tmp/decider-gemm', *common], Path('validation/gemm'))
-          runner.measure(['/tmp/llama-compare', '/tmp/base-bf16.gguf', '/tmp/lora-f32.gguf', '/tmp/prepared/head.json', '/tmp/prepared/cases.json', '3', '4'], Path('validation/llama-bf16'))
+          runner.measure(['/tmp/llama-compare', '/tmp/base-f16.gguf', '/tmp/lora-f32.gguf', '/tmp/prepared/head.json', '/tmp/prepared/cases.json', '3', '4'], Path('validation/llama-f16'))
           PY
-          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/baseline.jsonl validation/llama-bf16.jsonl > validation/baseline-vs-llama.json
-          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/gemm.jsonl validation/llama-bf16.jsonl > validation/gemm-vs-llama.json
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/baseline.jsonl validation/llama-f16.jsonl > validation/baseline-vs-llama-f16.json
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/gemm.jsonl validation/llama-f16.jsonl > validation/gemm-vs-llama-f16.json
           python3 scripts/check-blocking-results.py /tmp/prepared/cases.json validation/baseline.jsonl validation/gemm.jsonl --allow-rounding-differences | tee validation/gemm-summary.json
-          cat validation/gemm-vs-llama.json
-      - name: Projection cache-blocking sweep
-        run: cargo test --release --locked --lib benchmark_projection_blocking -- --ignored --nocapture > validation/blocking-sweep.log 2>&1
+          cat validation/gemm-vs-llama-f16.json
+      - name: F32 llama control on the same machine
+        run: |
+          rm /tmp/base-f16.gguf
+          python3 /tmp/llama.cpp/convert_hf_to_gguf.py models/v21/base --outtype f32 --outfile /tmp/base-f32.gguf > validation/f32-conversion.log 2>&1
+          sha256sum /tmp/base-f32.gguf > validation/f32-checksum.txt
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('runner', 'scripts/run-llama-comparison.py')
+          runner = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(runner)
+          runner.measure(['/tmp/llama-compare', '/tmp/base-f32.gguf', '/tmp/lora-f32.gguf', '/tmp/prepared/head.json', '/tmp/prepared/cases.json', '3', '4'], Path('validation/llama-f32'))
+          PY
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/gemm.jsonl validation/llama-f32.jsonl > validation/gemm-vs-llama-f32.json
+      - name: Profile real checkpoint operators separately from latency runs
+        run: |
+          cargo build --release --locked --features fast-gemm,profile --example compare_logits
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          cases = json.loads(Path('/tmp/prepared/cases.json').read_text())
+          Path('/tmp/profile-case.json').write_text(json.dumps(cases[-1:]))
+          PY
+          target/release/examples/compare_logits models/v21 /tmp/profile-case.json 1 4 > validation/operator-profile.jsonl 2> validation/operator-profile.log
       - name: Print measurement evidence for text-only review
         if: always()
         run: |
           python3 - <<'PY'
           from pathlib import Path
           for path in sorted(Path('validation').glob('*')):
-              if path.suffix in ('.json', '.jsonl') or path.name in ('environment.txt', 'blocking-sweep.log', 'gemm-parity.log'):
+              if path.suffix in ('.json', '.jsonl') or path.name in ('environment.txt', 'gemm-parity.log', 'operator-profile.log'):
                   print(path.name)
                   print(path.read_text())
           PY

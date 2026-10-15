@@ -33,6 +33,8 @@ python3 scripts/run-llama-comparison.py --native target/release/examples/compare
 
 For an F32 comparison, change the base converter's `--outtype` to `f32` and use a different GGUF output filename. F32 conversion expands the original BF16 values exactly. LoRA stays separate in both cases. The prepared files contain weights and should stay outside source control.
 
+On N1-compatible ARM builds, use F16 and F32 controls. At the pinned llama revision, `ggml_vec_dot_bf16` has no ARM SIMD branch and the BF16 `llamafile_sgemm` case has no ARM kernel, so its fallback is an unrepresentative primary speed target. F16 is a practical low-memory control, but conversion and activation arithmetic can introduce numerical differences; F32 expands the original values exactly. Record both output differences and performance for each format.
+
 The runner writes complete JSONL samples, process metadata and a summary. It refuses to overwrite an existing output directory. Compare logits with the independent reference as well as between engines; a faster run that misses the numerical gate is not strict correctness parity. The calibrated probability differences are computed with the pinned per-kind temperatures. Argmax equality alone is not calibration validation.
 
 ## Cache-blocking experiment on ARM64
@@ -51,9 +53,22 @@ The `fast-gemm` feature uses `ndarray`'s safe matrix views and Rust matrix-multi
 
 This path changes the base projection's FP32 reduction order. It must pass the original full-checkpoint test, including 4,096 tokens and the unchanged `1e-4` logit / `1e-5` probability, confidence and score tolerances. Per-projection tests check packed formats, tails, bias/LoRA and one/four workers against the original kernel with an explicit rounding bound. No bit-identity claim is made for GEMM.
 
-The **Matched CPU performance** workflow compares pinned main, this feature and llama.cpp serially on `ubuntu-24.04-arm`. Both native builds target Neoverse N1; llama uses ARMv8.2+FP16+dotprod tuned for N1, without BF16/I8MM/SVE instructions. The instruction-set restriction does not emulate Graviton2's cache, clock or memory system.
+The **Matched CPU performance** workflow compares pinned main, this feature and llama.cpp F16/F32 serially on `ubuntu-24.04-arm`. Both native builds target Neoverse N1; llama uses ARMv8.2+FP16+dotprod tuned for N1, without BF16/I8MM/SVE instructions. The instruction-set restriction does not emulate Graviton2's cache, clock or memory system.
 
-The workflow retains raw JSONL samples, RSS, source/model hashes, the full-checkpoint numerical test log, summaries and a block-size sweep as a 30-day artifact. Baseline/candidate rounding differences are reported, while reference tolerances remain fixed. The optional backend must remain experimental until its correctness and full-model performance have both been measured. These experiments do not deploy AWS resources.
+The workflow retains raw JSONL samples, RSS, source/model hashes, the full-checkpoint numerical test log, summaries and an instrumented real-model profile as a 30-day artifact. Baseline/candidate rounding differences are reported, while reference tolerances remain fixed. The optional backend must remain experimental until its correctness and full-model performance have both been measured. These experiments do not deploy AWS resources.
+
+## Output layout and real-model profiling
+
+Large projection outputs are transposed and combined in 16-by-16 tiles, with disjoint row blocks written in parallel. A fixed 1 KiB scratch tile reads complete source cache lines before applying the original bias/LoRA and write/add/SwiGLU arithmetic to contiguous destination spans. Small outputs retain the original loop. Boundary, signed-zero, adapter and epilogue tests compare every output bit on one and four workers.
+
+The optional `profile` feature emits `DECIDER_PROFILE` JSON records to stderr. It times projections, GEMM, output conversion, convolution, recurrence, attention and the model body on actual requests. Projection GEMM/write records are children of the projection span; do not add parent and child durations together. The normal benchmark binaries exclude this feature. A separate instrumented run follows the ARM latency measurements, because profiling can perturb timings. No allocation-count or hardware-counter claim is made.
+
+For a local operator trace:
+
+```sh
+RUSTFLAGS='-C target-cpu=native' cargo build --release --locked --features fast-gemm,profile --example compare_logits
+target/release/examples/compare_logits models/v21 /tmp/decider-comparison/cases.json 1 4 > /tmp/profile-results.jsonl 2> /tmp/profile.log
+```
 
 ## Limits
 
