@@ -10,7 +10,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}
+  group: performance-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: true
 jobs:
   compare:
@@ -46,14 +46,14 @@ jobs:
       - name: Build pinned main baseline and candidate
         run: |
           mkdir -p validation
-          cargo test --release --locked --features cache-blocking --lib
+          cargo test --release --locked --features fast-gemm --lib
           git fetch --depth 1 origin "$BASELINE_REVISION"
           git worktree add --detach /tmp/native-baseline "$BASELINE_REVISION"
           cp examples/compare_logits.rs /tmp/native-baseline/examples/compare_logits.rs
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked --manifest-path /tmp/native-baseline/Cargo.toml --example compare_logits
           cp target/release/examples/compare_logits /tmp/decider-baseline
-          cargo build --release --locked --features cache-blocking --example compare_logits
-          cp target/release/examples/compare_logits /tmp/decider-blocked
+          cargo build --release --locked --features fast-gemm --example compare_logits
+          cp target/release/examples/compare_logits /tmp/decider-gemm
       - name: Build llama CPU and convert exact pinned weights
         run: |
           cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16+dotprod -DCMAKE_C_FLAGS=-mtune=neoverse-n1 -DCMAKE_CXX_FLAGS=-mtune=neoverse-n1 -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
@@ -73,6 +73,7 @@ jobs:
             git rev-parse HEAD
             git -C /tmp/native-baseline rev-parse HEAD
             git -C /tmp/llama.cpp rev-parse HEAD
+            echo native_features=fast-gemm
             cat models/v21/revisions.json
             for path in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us /sys/fs/cgroup/memory/memory.limit_in_bytes; do
               if [ -r "$path" ]; then
@@ -85,7 +86,14 @@ jobs:
             sha256sum /tmp/base-bf16.gguf /tmp/lora-f32.gguf /tmp/prepared/cases.json scripts/llama-compare.cpp
             grep -E 'GGML_NATIVE:|GGML_CPU_ARM_ARCH:' /tmp/llama.cpp/build/CMakeCache.txt
           } > validation/environment.txt
-      - name: Serial full-model native baseline, blocked candidate, llama BF16
+      - name: Required full-checkpoint GEMM numerical parity
+        shell: bash
+        env:
+          DECIDER_TEST_MODEL_DIR: models/v21
+        run: |
+          set -o pipefail
+          cargo test --release --locked --features fast-gemm --test model -- --ignored --nocapture 2>&1 | tee validation/gemm-parity.log
+      - name: Serial full-model native baseline, GEMM candidate, llama BF16
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -95,13 +103,13 @@ jobs:
           spec.loader.exec_module(runner)
           common = ['models/v21', '/tmp/prepared/cases.json', '3', '4']
           runner.measure(['/tmp/decider-baseline', *common], Path('validation/baseline'))
-          runner.measure(['/tmp/decider-blocked', *common], Path('validation/blocked'))
+          runner.measure(['/tmp/decider-gemm', *common], Path('validation/gemm'))
           runner.measure(['/tmp/llama-compare', '/tmp/base-bf16.gguf', '/tmp/lora-f32.gguf', '/tmp/prepared/head.json', '/tmp/prepared/cases.json', '3', '4'], Path('validation/llama-bf16'))
           PY
           python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/baseline.jsonl validation/llama-bf16.jsonl > validation/baseline-vs-llama.json
-          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/blocked.jsonl validation/llama-bf16.jsonl > validation/blocked-vs-llama.json
-          python3 scripts/check-blocking-results.py /tmp/prepared/cases.json validation/baseline.jsonl validation/blocked.jsonl | tee validation/blocking-summary.json
-          cat validation/blocked-vs-llama.json
+          python3 scripts/summarize-llama-comparison.py /tmp/prepared/cases.json validation/gemm.jsonl validation/llama-bf16.jsonl > validation/gemm-vs-llama.json
+          python3 scripts/check-blocking-results.py /tmp/prepared/cases.json validation/baseline.jsonl validation/gemm.jsonl --allow-rounding-differences | tee validation/gemm-summary.json
+          cat validation/gemm-vs-llama.json
       - name: Projection cache-blocking sweep
         run: cargo test --release --locked --lib benchmark_projection_blocking -- --ignored --nocapture > validation/blocking-sweep.log 2>&1
       - name: Print measurement evidence for text-only review
@@ -110,7 +118,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           for path in sorted(Path('validation').glob('*')):
-              if path.suffix in ('.json', '.jsonl') or path.name in ('environment.txt', 'blocking-sweep.log'):
+              if path.suffix in ('.json', '.jsonl') or path.name in ('environment.txt', 'blocking-sweep.log', 'gemm-parity.log'):
                   print(path.name)
                   print(path.read_text())
           PY

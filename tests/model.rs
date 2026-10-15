@@ -47,7 +47,7 @@ fn check_reference(engine: &NativeEngine, req: &Request, reference: &Value) {
         for (a, b) in logits.iter().zip(expected) {
             assert!(
                 (*a as f64 - b.as_f64().unwrap()).abs() < 1e-4,
-                "{name}: logit parity"
+                "{name}: logit parity: actual={a}, expected={b}"
             );
         }
     }

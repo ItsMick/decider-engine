@@ -198,6 +198,10 @@ impl Projection<'_> {
                 return columns;
             }
         }
+        #[cfg(feature = "fast-gemm")]
+        if x.len() / self.input >= 64 && self.input >= 1024 && self.output >= 128 {
+            return self.columns_gemm(x);
+        }
         if cfg!(feature = "cache-blocking")
             && x.len() / self.input >= 64
             && self.input >= 256
@@ -213,6 +217,53 @@ impl Projection<'_> {
     /// is 3. Both produce bit-identical results.
     fn columns_tiled<const T: usize>(&self, x: &[f32]) -> Vec<f32> {
         self.columns_blocked::<T, T, { usize::MAX }>(x)
+    }
+
+    /// A safe view onto a packed weight panel; the optional Rust GEMM backend
+    /// owns its packing and SIMD dispatch. Its reduction order can differ.
+    #[cfg(feature = "fast-gemm")]
+    fn columns_gemm(&self, x: &[f32]) -> Vec<f32> {
+        use ndarray::{linalg::general_mat_mul, ArrayView2, ArrayViewMut2, ShapeBuilder};
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
+        let a = ArrayView2::from_shape((rows, input), x).expect("validated input shape");
+        let mut columns = vec![0.0; rows * output];
+        columns
+            .par_chunks_mut(rows * 128)
+            .enumerate()
+            .for_each_init(
+                || (Vec::new(), Vec::new()),
+                |(weights_scratch, adapter_scratch), (block, dst)| {
+                    let first = block * 128;
+                    let count = dst.len() / rows;
+                    let packed = self
+                        .weights
+                        .row(first * input, count * input, weights_scratch);
+                    let b = ArrayView2::from_shape((count, input), packed)
+                        .expect("validated weight panel");
+                    let mut c = ArrayViewMut2::from_shape((rows, count).f(), &mut *dst)
+                        .expect("disjoint column panel");
+                    general_mat_mul(1.0, &a, &b.t(), 0.0, &mut c);
+                    for (j, column) in dst.chunks_exact_mut(rows).enumerate() {
+                        let bias = self.bias.map_or(0.0, |bias| bias[first + j]);
+                        let adapter = self.adapter.as_ref().map(|adapter| {
+                            (
+                                adapter,
+                                adapter.weights.row(
+                                    (first + j) * adapter.rank,
+                                    adapter.rank,
+                                    adapter_scratch,
+                                ),
+                            )
+                        });
+                        for (row, value) in column.iter_mut().enumerate() {
+                            let base = *value + bias;
+                            *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+                        }
+                    }
+                },
+            );
+        columns
     }
 
     /// Keep a row block hot while projecting it against C output columns.
@@ -1014,6 +1065,72 @@ mod tests {
                 time("c48r24", &mut || p.columns_blocked::<48, TILE, 24>(&x));
                 time("c48r12", &mut || p.columns_blocked::<48, TILE, 12>(&x));
                 time("c96r24", &mut || p.columns_blocked::<96, TILE, 24>(&x));
+            }
+        }
+    }
+
+    #[cfg(feature = "fast-gemm")]
+    #[test]
+    fn gemm_columns_match_reference_across_panels_and_layouts() {
+        let rank = 5;
+        for (rows, input, output) in [
+            (1, 9, 1),
+            (2, 33, 3),
+            (25, 257, 25),
+            (63, 1024, 129),
+            (64, 1024, 128),
+            (65, 1025, 131),
+        ] {
+            let x: Vec<f32> = (0..rows * input)
+                .map(|i| (i % 31) as f32 / 16.0 - 0.9)
+                .collect();
+            let bias: Vec<f32> = (0..output).map(|i| (i % 7) as f32 / 13.0).collect();
+            let mid: Vec<f32> = (0..rows * rank)
+                .map(|i| (i % 11) as f32 / 19.0 - 0.2)
+                .collect();
+            let adapter_weights = Data::F32(
+                (0..output * rank)
+                    .map(|i| (i % 9) as f32 / 23.0 - 0.1)
+                    .collect(),
+            );
+            let values: Vec<f32> = (0..output * input)
+                .map(|i| ((i * 17 % 89) as f32 - 44.0) / (32.0 * (input as f32).sqrt()))
+                .collect();
+            let bf16 = || Data::Bf16(values.iter().map(|v| (v.to_bits() >> 16) as u16).collect());
+            for weights in [
+                Data::F32(values.clone()),
+                bf16(),
+                bf16().quantize(input, Precision::Int8),
+                bf16().quantize(input, Precision::Int4),
+            ] {
+                for (with_bias, with_adapter) in [(false, false), (true, false), (true, true)] {
+                    let p = Projection {
+                        input,
+                        output,
+                        weights: &weights,
+                        bias: with_bias.then_some(&bias[..]),
+                        adapter: with_adapter.then_some(Adapter {
+                            inputs: &mid,
+                            weights: &adapter_weights,
+                            rank,
+                            scale: 0.375,
+                        }),
+                    };
+                    let expected = p.columns_tiled::<1>(&x);
+                    for workers in [1, 4] {
+                        let pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(workers)
+                            .build()
+                            .unwrap();
+                        let actual = pool.install(|| p.columns_gemm(&x));
+                        for (got, want) in actual.iter().zip(&expected) {
+                            assert!(
+                                (got - want).abs() <= 1e-5 + 5e-6 * want.abs(),
+                                "{rows}x{input}->{output}: {got} != {want}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

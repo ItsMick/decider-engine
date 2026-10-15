@@ -41,9 +41,19 @@ The `cache-blocking` feature is opt-in. For projections with at least 64 rows, 2
 
 The converted weight block needs at most `24 * input_width * 4` bytes per active worker, with reusable worker scratch. This increases temporary conversion storage compared with the original one/three-column tasks, while avoiding a full-model FP32 weight expansion. The sweep compares several row/column block sizes to expose shape-dependent regressions.
 
-The **Matched CPU performance** workflow runs the experiment on `ubuntu-24.04-arm`. It compares a pinned main source revision, the candidate feature and pinned llama.cpp, serially, with the same four reference probes. Both native builds target Neoverse N1; llama's CPU build uses ARMv8.2+FP16+dotprod, tuned for Neoverse N1, without newer BF16/I8MM/SVE instructions. This restricts the instruction set but does not emulate Graviton2's cache, clock or memory system.
+The first ARM experiment compares this feature with a pinned main source revision and pinned llama.cpp. The later GEMM experiment below uses the same probes and baseline.
 
-The workflow retains JSONL samples, process RSS, build/conversion logs, source/model hashes, summaries and a block-size sweep as a 30-day artifact. Native baseline and candidate logits must be identical and within the independent `1e-4` logit tolerance; performance results do not waive correctness. The feature should remain opt-in unless full-model measurements justify a default change. These measurements do not authorize or require an AWS deployment.
+The cache-blocked candidate must keep native logits identical and within the independent `1e-4` logit tolerance. The feature should remain opt-in unless full-model measurements justify a default change.
+
+## Optional Rust GEMM backend
+
+The `fast-gemm` feature uses `ndarray`'s safe matrix views and Rust matrix-multiplication backend for projections with at least 64 token rows, 1,024 input columns and 128 output columns. Input/output views borrow existing buffers. Each Rayon task converts at most 128 adjacent weight rows into reusable scratch; model weights stay in their original storage. Bias, LoRA and epilogues retain their existing formulas. The INT8-compute kernel and smaller projections retain their current paths. No new unsafe code is introduced in this crate.
+
+This path changes the base projection's FP32 reduction order. It must pass the original full-checkpoint test, including 4,096 tokens and the unchanged `1e-4` logit / `1e-5` probability, confidence and score tolerances. Per-projection tests check packed formats, tails, bias/LoRA and one/four workers against the original kernel with an explicit rounding bound. No bit-identity claim is made for GEMM.
+
+The **Matched CPU performance** workflow compares pinned main, this feature and llama.cpp serially on `ubuntu-24.04-arm`. Both native builds target Neoverse N1; llama uses ARMv8.2+FP16+dotprod tuned for N1, without BF16/I8MM/SVE instructions. The instruction-set restriction does not emulate Graviton2's cache, clock or memory system.
+
+The workflow retains raw JSONL samples, RSS, source/model hashes, the full-checkpoint numerical test log, summaries and a block-size sweep as a 30-day artifact. Baseline/candidate rounding differences are reported, while reference tolerances remain fixed. The optional backend must remain experimental until its correctness and full-model performance have both been measured. These experiments do not deploy AWS resources.
 
 ## Limits
 
