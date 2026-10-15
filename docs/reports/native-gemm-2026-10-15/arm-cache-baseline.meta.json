@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/tmp/decider-baseline",
+    "models/v21",
+    "/tmp/prepared/cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 169.7141011189999,
+  "peak_rss_kib": 3932600
+}

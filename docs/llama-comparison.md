@@ -37,15 +37,9 @@ On N1-compatible ARM builds, use F16 and F32 controls. At the pinned llama revis
 
 The runner writes complete JSONL samples, process metadata and a summary. It refuses to overwrite an existing output directory. Compare logits with the independent reference as well as between engines; a faster run that misses the numerical gate is not strict correctness parity. The calibrated probability differences are computed with the pinned per-kind temperatures. Argmax equality alone is not calibration validation.
 
-## Cache-blocking experiment on ARM64
+## Earlier projection row-blocking experiment
 
-The `cache-blocking` feature is opt-in. For projections with at least 64 rows, 256 input columns and 24 output columns, it computes a 24-row activation block against 24 output columns before advancing to the next row block. It keeps each original dot product's arithmetic order. The INT8-compute kernel, small projections and default build keep their existing selection.
-
-The converted weight block needs at most `24 * input_width * 4` bytes per active worker, with reusable worker scratch. This increases temporary conversion storage compared with the original one/three-column tasks, while avoiding a full-model FP32 weight expansion. The sweep compares several row/column block sizes to expose shape-dependent regressions.
-
-The first ARM experiment compares this feature with a pinned main source revision and pinned llama.cpp. The later GEMM experiment below uses the same probes and baseline.
-
-The cache-blocked candidate must keep native logits identical and within the independent `1e-4` logit tolerance. The feature should remain opt-in unless full-model measurements justify a default change.
+Commit `bd670ae071e47e63774e28c6df0ee1d5df154b0d` tested 24 token rows against 24 output columns while keeping the original dot products. On the matched four-worker ARM runner it preserved logits exactly, improved the 1,024-token median from 33.95 to 30.95 seconds, and left short medians about 1% slower. This experiment was removed in favor of the GEMM path and the separate output-tiling improvement. Its code remains available at that commit; raw measurements are retained in the report evidence.
 
 ## Optional Rust GEMM backend
 
@@ -53,7 +47,9 @@ The `fast-gemm` feature uses `ndarray`'s safe matrix views and Rust matrix-multi
 
 This path changes the base projection's FP32 reduction order. It must pass the original full-checkpoint test, including 4,096 tokens and the unchanged `1e-4` logit / `1e-5` probability, confidence and score tolerances. Per-projection tests check packed formats, tails, bias/LoRA and one/four workers against the original kernel with an explicit rounding bound. No bit-identity claim is made for GEMM.
 
-The **Matched CPU performance** workflow compares pinned main, this feature and llama.cpp F16/F32 serially on `ubuntu-24.04-arm`. Both native builds target Neoverse N1; llama uses ARMv8.2+FP16+dotprod tuned for N1, without BF16/I8MM/SVE instructions. The instruction-set restriction does not emulate Graviton2's cache, clock or memory system.
+The default backend retains bit-identical prefix continuation. With `fast-gemm`, batch-shape-dependent kernel selection can introduce rounding differences between cached and uncached execution; both are checked against the unchanged independent reference tolerances. This is one reason the feature remains explicit.
+
+The opt-in **Matched CPU performance** workflow compares pinned main, this feature and llama.cpp F16/F32 serially on `ubuntu-24.04-arm`. Start it manually when collecting performance evidence; ordinary PRs retain lightweight checks. Both native builds target Neoverse N1; llama uses ARMv8.2+FP16+dotprod tuned for N1, without BF16/I8MM/SVE instructions. The instruction-set restriction does not emulate Graviton2's cache, clock or memory system.
 
 The workflow retains raw JSONL samples, RSS, source/model hashes, the full-checkpoint numerical test log, summaries and an instrumented real-model profile as a 30-day artifact. Baseline/candidate rounding differences are reported, while reference tolerances remain fixed. The optional backend must remain experimental until its correctness and full-model performance have both been measured. These experiments do not deploy AWS resources.
 

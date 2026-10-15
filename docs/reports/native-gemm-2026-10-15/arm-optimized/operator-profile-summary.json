@@ -1,0 +1,20 @@
+{
+  "warmup": {
+    "projection.write": 499.81357699999995,
+    "projection": 16233.191578999998,
+    "projection.gemm": 14542.239279,
+    "convolution": 166.72895600000004,
+    "recurrence": 665.4660080000001,
+    "attention": 689.3780499999999,
+    "model": 18050.297808
+  },
+  "measured": {
+    "projection.write": 497.64707500000014,
+    "projection": 16232.148251000008,
+    "projection.gemm": 14551.822730000007,
+    "convolution": 165.144087,
+    "recurrence": 668.938686,
+    "attention": 705.6002779999999,
+    "model": 18068.668226
+  }
+}

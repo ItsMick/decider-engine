@@ -35,6 +35,15 @@ readout use FP32.
 The v21 model occupies roughly 4 GB resident memory. Loading streams tensors
 through a bounded buffer instead of holding a second copy of the checkpoint.
 
+For experimental larger-batch CPU acceleration, build with
+`cargo build --release --locked --features fast-gemm`. This uses a Rust GEMM
+backend with the same FP32 arithmetic precision and packed weight storage;
+reduction order can differ. The original reference tolerances remain required.
+The [matched ARM report](docs/reports/native-gemm-2026-10-15.md) records
+18.05 s at 1,024 tokens, versus 25.79 s for llama.cpp F32 and 14.30 s for its
+F16 path on the same runner. See the [comparison guide](docs/llama-comparison.md)
+for build flags, numerical differences and reproducible commands.
+
 With no request file, stdin accepts one JSON request per line and stdout returns
 one line per non-blank input line, in order. The model stays loaded until EOF.
 A request that cannot be answered produces an error line instead of a response,

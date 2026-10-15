@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/tmp/decider-blocked",
+    "models/v21",
+    "/tmp/prepared/cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 157.7789792850001,
+  "peak_rss_kib": 3934672
+}

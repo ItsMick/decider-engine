@@ -1,0 +1,13 @@
+    Finished `release` profile [optimized] target(s) in 0.13s
+     Running tests/model.rs (decider-engine/target/native/release/deps/model-f63cfad4f66d2bfb)
+
+running 1 test
+checking "original-three"
+checking "reversed-choice"
+checking "short-noul"
+checking "window-1024"
+test pinned_v21_matches_pytorch_tokens_logits_and_decisions has been running for over 60 seconds
+checking "window-4096"
+test pinned_v21_matches_pytorch_tokens_logits_and_decisions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 202.27s

@@ -1,0 +1,14 @@
+{
+  "command": [
+    "/tmp/llama-compare",
+    "/tmp/base-f16.gguf",
+    "/tmp/lora-f32.gguf",
+    "/tmp/prepared/head.json",
+    "/tmp/prepared/cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 72.78186328400011,
+  "peak_rss_kib": 4127080
+}

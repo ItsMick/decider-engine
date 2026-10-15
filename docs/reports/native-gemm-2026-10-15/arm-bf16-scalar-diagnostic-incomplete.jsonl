@@ -1,0 +1,15 @@
+{"load_ms":459.253174,"threads":4}
+{"id":"original-three/route","sample":0,"warmup":true,"tokens":87,"elapsed_ms":38723.478866,"logits":[1.3305988311767578,0.634615957736969,-2.058663845062256]}
+{"id":"original-three/route","sample":1,"warmup":false,"tokens":87,"elapsed_ms":38632.973576,"logits":[1.3305988311767578,0.634615957736969,-2.058663845062256]}
+{"id":"original-three/route","sample":2,"warmup":false,"tokens":87,"elapsed_ms":38672.053993,"logits":[1.3305988311767578,0.634615957736969,-2.058663845062256]}
+{"id":"original-three/route","sample":3,"warmup":false,"tokens":87,"elapsed_ms":38640.494534,"logits":[1.3305988311767578,0.634615957736969,-2.058663845062256]}
+{"id":"original-three/urgent","sample":0,"warmup":true,"tokens":86,"elapsed_ms":38182.293001,"logits":[-0.6520839333534241,1.4078984260559082]}
+{"id":"original-three/urgent","sample":1,"warmup":false,"tokens":86,"elapsed_ms":38198.282822,"logits":[-0.6520839333534241,1.4078984260559082]}
+{"id":"original-three/urgent","sample":2,"warmup":false,"tokens":86,"elapsed_ms":38207.132943,"logits":[-0.6520839333534241,1.4078984260559082]}
+{"id":"original-three/urgent","sample":3,"warmup":false,"tokens":86,"elapsed_ms":38169.271429,"logits":[-0.6520839333534241,1.4078984260559082]}
+{"id":"original-three/severity","sample":0,"warmup":true,"tokens":88,"elapsed_ms":39098.783714,"logits":[-0.7161964178085327,0.13999375700950623,0.324670672416687]}
+{"id":"original-three/severity","sample":1,"warmup":false,"tokens":88,"elapsed_ms":39078.190846,"logits":[-0.7161964178085327,0.13999375700950623,0.324670672416687]}
+{"id":"original-three/severity","sample":2,"warmup":false,"tokens":88,"elapsed_ms":39083.953861,"logits":[-0.7161964178085327,0.13999375700950623,0.324670672416687]}
+{"id":"original-three/severity","sample":3,"warmup":false,"tokens":88,"elapsed_ms":39089.162834,"logits":[-0.7161964178085327,0.13999375700950623,0.324670672416687]}
+{"id":"window-1024/q","sample":0,"warmup":true,"tokens":1024,"elapsed_ms":454302.602986,"logits":[-1.1095924377441406,1.4014209508895874]}
+{"id":"window-1024/q","sample":1,"warmup":false,"tokens":1024,"elapsed_ms":454358.829271,"logits":[-1.1095924377441406,1.4014209508895874]}

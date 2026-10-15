@@ -1,0 +1,38 @@
+{
+  "identical_logits": true,
+  "rounding_differences_allowed": false,
+  "cases": [
+    {
+      "id": "original-three/route",
+      "tokens": 87,
+      "baseline_ms": 2351.370531,
+      "candidate_ms": 2371.104584,
+      "speedup": 0.991677274324733,
+      "max_reference_logit_error": 1.3709068298339844e-06
+    },
+    {
+      "id": "original-three/urgent",
+      "tokens": 86,
+      "baseline_ms": 2344.3205159999998,
+      "candidate_ms": 2368.691842,
+      "speedup": 0.9897110609460188,
+      "max_reference_logit_error": 2.5033950805664062e-06
+    },
+    {
+      "id": "original-three/severity",
+      "tokens": 88,
+      "baseline_ms": 2387.8355989999995,
+      "candidate_ms": 2411.564009,
+      "speedup": 0.9901605721799439,
+      "max_reference_logit_error": 1.8775463104248047e-06
+    },
+    {
+      "id": "window-1024/q",
+      "tokens": 1024,
+      "baseline_ms": 33946.289106000004,
+      "candidate_ms": 30950.67429,
+      "speedup": 1.0967867384061443,
+      "max_reference_logit_error": 8.344650268554688e-07
+    }
+  ]
+}

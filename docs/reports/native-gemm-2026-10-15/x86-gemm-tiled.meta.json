@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/tmp/decider-gemm-tiled",
+    "decider-engine/models/v21",
+    "/tmp/gemm-cases.json",
+    "3",
+    "4"
+  ],
+  "exit_code": 0,
+  "wall_s": 91.54608030800046,
+  "peak_rss_kib": 3944784
+}

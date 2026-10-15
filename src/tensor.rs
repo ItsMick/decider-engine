@@ -212,21 +212,74 @@ impl Projection<'_> {
         if x.len() / self.input >= 64 && self.input >= 1024 && self.output >= 128 {
             return self.columns_gemm(x);
         }
-        if cfg!(feature = "cache-blocking")
-            && x.len() / self.input >= 64
-            && self.input >= 256
-            && self.output >= 24
-        {
-            self.columns_blocked::<24, TILE, 24>(x)
-        } else {
-            self.columns_tiled::<TILE>(x)
-        }
+        self.columns_tiled::<TILE>(x)
     }
 
     /// Single-dot-product columns when `T` is 1; 3x3 `dot_tile` blocks when `T`
     /// is 3. Both produce bit-identical results.
     fn columns_tiled<const T: usize>(&self, x: &[f32]) -> Vec<f32> {
-        self.columns_blocked::<T, T, { usize::MAX }>(x)
+        let (input, output) = (self.input, self.output);
+        let rows = x.len() / input;
+        let tokens: Vec<&[f32]> = x.chunks_exact(input).collect();
+        // Each task computes T adjacent columns for every row.
+        let compute = |group: usize, dst: &mut [f32], scratch: &mut Scratch<T>| {
+            let first = group * T;
+            let count = dst.len() / rows;
+            let weights: Vec<&[f32]> = scratch.weights[..count]
+                .iter_mut()
+                .enumerate()
+                .map(|(j, buf)| self.weights.row((first + j) * input, input, buf))
+                .collect();
+            let mut row = 0;
+            if let [w0, w1, w2] = weights[..] {
+                while row + 3 <= rows {
+                    let tile = dot_tile(
+                        [tokens[row], tokens[row + 1], tokens[row + 2]],
+                        [w0, w1, w2],
+                    );
+                    for (i, values) in tile.iter().enumerate() {
+                        for (j, value) in values.iter().enumerate() {
+                            dst[j * rows + row + i] = *value;
+                        }
+                    }
+                    row += 3;
+                }
+            }
+            for row in row..rows {
+                for (j, w) in weights.iter().enumerate() {
+                    dst[j * rows + row] = dot_scores(tokens[row], w);
+                }
+            }
+            for (j, column) in dst.chunks_mut(rows).enumerate() {
+                let adapter = self.adapter.as_ref().map(|a| {
+                    (
+                        a,
+                        a.weights
+                            .row((first + j) * a.rank, a.rank, &mut scratch.adapter),
+                    )
+                });
+                let b = self.bias.map_or(0.0, |b| b[first + j]);
+                for (row, value) in column.iter_mut().enumerate() {
+                    let base = *value + b;
+                    *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
+                }
+            }
+        };
+        let mut columns = vec![0.0; rows * output];
+        if rows * output >= 512 {
+            columns
+                .par_chunks_mut(rows * T)
+                .enumerate()
+                .for_each_init(Scratch::new, |scratch, (group, dst)| {
+                    compute(group, dst, scratch)
+                });
+        } else {
+            let mut scratch = Scratch::new();
+            for (group, dst) in columns.chunks_mut(rows * T).enumerate() {
+                compute(group, dst, &mut scratch);
+            }
+        }
+        columns
     }
 
     /// A safe view onto a packed weight panel; the optional Rust GEMM backend
@@ -275,83 +328,6 @@ impl Projection<'_> {
                     }
                 },
             );
-        columns
-    }
-
-    /// Keep a row block hot while projecting it against C output columns.
-    /// Every individual dot still uses the original eight-lane reduction.
-    fn columns_blocked<const C: usize, const T: usize, const R: usize>(
-        &self,
-        x: &[f32],
-    ) -> Vec<f32> {
-        assert!(C > 0 && R > 0 && (T == 1 || T == 3) && C.is_multiple_of(T));
-        let (input, output) = (self.input, self.output);
-        let rows = x.len() / input;
-        let tokens: Vec<&[f32]> = x.chunks_exact(input).collect();
-        // Each task owns C adjacent full columns, so writes remain disjoint.
-        let compute = |group: usize, dst: &mut [f32], scratch: &mut Scratch<C>| {
-            let first = group * C;
-            let count = dst.len() / rows;
-            let weights: Vec<&[f32]> = scratch.weights[..count]
-                .iter_mut()
-                .enumerate()
-                .map(|(j, buf)| self.weights.row((first + j) * input, input, buf))
-                .collect();
-            for row_start in (0..rows).step_by(R) {
-                let end = row_start.saturating_add(R).min(rows);
-                for col in (0..count).step_by(T) {
-                    let width = T.min(count - col);
-                    let mut row = row_start;
-                    if T == 3 && width == 3 {
-                        while row + 3 <= end {
-                            let tile = dot_tile(
-                                [tokens[row], tokens[row + 1], tokens[row + 2]],
-                                [weights[col], weights[col + 1], weights[col + 2]],
-                            );
-                            for (i, values) in tile.iter().enumerate() {
-                                for (j, value) in values.iter().enumerate() {
-                                    dst[(col + j) * rows + row + i] = *value;
-                                }
-                            }
-                            row += 3;
-                        }
-                    }
-                    for row in row..end {
-                        for j in col..col + width {
-                            dst[j * rows + row] = dot_scores(tokens[row], weights[j]);
-                        }
-                    }
-                }
-            }
-            for (j, column) in dst.chunks_mut(rows).enumerate() {
-                let adapter = self.adapter.as_ref().map(|a| {
-                    (
-                        a,
-                        a.weights
-                            .row((first + j) * a.rank, a.rank, &mut scratch.adapter),
-                    )
-                });
-                let b = self.bias.map_or(0.0, |b| b[first + j]);
-                for (row, value) in column.iter_mut().enumerate() {
-                    let base = *value + b;
-                    *value = adapter.map_or(base, |(a, w)| a.combine(base, row, w));
-                }
-            }
-        };
-        let mut columns = vec![0.0; rows * output];
-        if rows * output >= 512 {
-            columns
-                .par_chunks_mut(rows * C)
-                .enumerate()
-                .for_each_init(Scratch::new, |scratch, (group, dst)| {
-                    compute(group, dst, scratch)
-                });
-        } else {
-            let mut scratch = Scratch::new();
-            for (group, dst) in columns.chunks_mut(rows * C).enumerate() {
-                compute(group, dst, &mut scratch);
-            }
-        }
         columns
     }
 }
@@ -1055,9 +1031,6 @@ mod tests {
                         projection.columns(&x),
                         projection.columns_tiled::<1>(&x),
                         projection.columns_tiled::<3>(&x),
-                        projection.columns_blocked::<24, 1, 24>(&x),
-                        projection.columns_blocked::<24, 3, 24>(&x),
-                        projection.columns_blocked::<48, 3, 16>(&x),
                     ] {
                         assert!(
                             actual
@@ -1068,57 +1041,6 @@ mod tests {
                         );
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "real projection cache-blocking sweep; use release and fixed workers"]
-    fn benchmark_projection_blocking() {
-        use std::{hint::black_box, time::Instant};
-        println!(
-            "blocking arch={} workers={}",
-            std::env::consts::ARCH,
-            rayon::current_num_threads()
-        );
-        let tokens: Vec<usize> = std::env::var("PROFILE_TOKENS")
-            .map(|v| v.split(',').map(|n| n.parse().unwrap()).collect())
-            .unwrap_or_else(|_| vec![64, 512]);
-        for (input, output) in [(2048, 6144), (6144, 2048)] {
-            let weights = Data::Bf16(
-                (0..input * output)
-                    .map(|i| ((((i * 17 % 89) as f32 - 44.0) / 32.0).to_bits() >> 16) as u16)
-                    .collect(),
-            );
-            let p = Projection {
-                input,
-                output,
-                weights: &weights,
-                bias: None,
-                adapter: None,
-            };
-            for &rows in &tokens {
-                let x: Vec<f32> = (0..rows * input)
-                    .map(|i| (i % 31) as f32 / 16.0 - 0.9)
-                    .collect();
-                let expected = p.columns_tiled::<TILE>(&x);
-                let time = |name: &str, f: &mut dyn FnMut() -> Vec<f32>| {
-                    assert_eq!(f(), expected, "{name}");
-                    let start = Instant::now();
-                    for _ in 0..2 {
-                        black_box(f());
-                    }
-                    println!(
-                        "blocking shape={rows}x{input}->{output} plan={name} ms={:.3}",
-                        start.elapsed().as_secs_f64() * 500.0
-                    );
-                };
-                time("original", &mut || p.columns_tiled::<TILE>(&x));
-                time("c12r24", &mut || p.columns_blocked::<12, TILE, 24>(&x));
-                time("c24r24", &mut || p.columns_blocked::<24, TILE, 24>(&x));
-                time("c48r24", &mut || p.columns_blocked::<48, TILE, 24>(&x));
-                time("c48r12", &mut || p.columns_blocked::<48, TILE, 12>(&x));
-                time("c96r24", &mut || p.columns_blocked::<96, TILE, 24>(&x));
             }
         }
     }

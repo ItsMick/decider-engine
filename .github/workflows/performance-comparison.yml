@@ -1,12 +1,6 @@
 name: Matched CPU performance
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/performance-comparison.yml'
-      - 'src/tensor.rs'
-      - 'examples/compare_logits.rs'
-      - 'scripts/*llama*'
 permissions:
   contents: read
 concurrency:
